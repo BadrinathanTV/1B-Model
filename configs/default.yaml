@@ -1,0 +1,70 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Default Configuration — 1B SLM (Blackwell / NVFP4)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Usage:
+#   python train.py --config configs/default.yaml
+#   python train.py --config configs/1b_nvfp4.yaml  # production preset
+
+# ─── Model Architecture ──────────────────────────────────────────────────────
+model:
+  vocab_size: 64000
+  hidden_size: 2048
+  num_hidden_layers: 24
+  num_attention_heads: 16
+  intermediate_size: 8192
+  max_position_embeddings: 8192
+  rms_norm_eps: 1.0e-6
+
+  # MLA (Multi-Head Latent Attention)
+  kv_lora_rank: 512
+  q_lora_rank: 1536
+  qk_rope_head_dim: 64
+  v_head_dim: 128
+  rope_theta: 10000.0
+
+  # TST (Token Superposition Training)
+  tst_group_size: 2       # Set >1 during TST phase
+
+  # MTP (Multi-Token Prediction)
+  mtp_depth: 2             # Number of future tokens to predict (1 = standard LM)
+
+  # Weight Tying & Memory Optimizations
+  tie_word_embeddings: true
+  max_delta_history: 0     # 0 means keep full history
+
+# ─── Precision / NVFP4 ───────────────────────────────────────────────────────
+precision:
+  high_precision_start_layers: 2    # First N layers forced to BF16
+  high_precision_end_layers: 4      # Last N layers forced to BF16
+  nvfp4_disable_rht: true
+  nvfp4_disable_stochastic_rounding: true
+
+# ─── Optimizer ────────────────────────────────────────────────────────────────
+optimizer:
+  type: "hybrid"                    # "hybrid" | "nf_aurora" | "adamw"
+  base_lr: 1.0e-3
+
+  # Riemannian Aurora settings (for 2D matrix weights)
+  aurora:
+    momentum: 0.95
+    weight_decay: 0.1
+    nesterov: true
+    use_riemannian: true
+
+  # AdamW settings (for 1D params, embeddings, norms)
+  adamw:
+    lr_scale: 0.1                   # Multiplied by base_lr
+    betas: [0.9, 0.95]
+    eps: 1.0e-10
+    weight_decay: 0.1
+
+# ─── Training ─────────────────────────────────────────────────────────────────
+training:
+  batch_size: 2
+  seq_len: 512
+  max_steps: 5
+  mtp_loss_weight: 0.3
+  gradient_clip: 1.0
+  log_interval: 1
+  seed: 42
+  device: "auto"                    # "auto" | "cuda" | "cpu"
