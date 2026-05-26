@@ -23,7 +23,7 @@ Allows training-time sequence length compression by averaging consecutive tokens
 
 ### 4. Multi-Token Prediction (MTP)
 An auxiliary prediction framework that predicts multiple future tokens ($t+1, t+2, \dots$) in parallel:
-* Implements stacked projection modules containing `RMSNorm -> Linear -> SiLU -> Linear` with residual skips to prevent dimensional collapse.
+* Implements stacked projection modules using a **SwiGLU** gating mechanism (`RMSNorm -> SwiGLU(gate * up) -> down` with residual skip) to prevent representation collapse.
 * Includes NaN-guards during training to gracefully bypass auxiliary loss calculation if sequences are shorter than prediction depth.
 
 ---

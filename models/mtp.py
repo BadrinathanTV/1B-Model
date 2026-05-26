@@ -5,21 +5,21 @@ from config import SLMConfig
 from layers.norm import RMSNorm
 
 class MTPProjection(nn.Module):
-    """Single MTP projection head with non-linearity and residual connection.
+    """Single MTP projection head using a SwiGLU gating mechanism.
     
-    Each head: RMSNorm -> Linear -> SiLU -> Linear (with residual).
-    This prevents the linear collapse that occurs when stacking bare
-    nn.Sequential(RMSNorm, Linear) projections.
+    Each head: RMSNorm -> SwiGLU (gate_proj * up_proj) -> down_proj (with residual).
+    This prevents the linear collapse that occurs when stacking projections.
     """
     def __init__(self, config: SLMConfig):
         super().__init__()
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.gate_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.down_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         
     def forward(self, x):
         h = self.norm(x)
-        h = self.down_proj(F.silu(self.up_proj(h)))
+        h = self.down_proj(F.silu(self.gate_proj(h)) * self.up_proj(h))
         return x + h  # Residual connection
 
 class MTPModule(nn.Module):
