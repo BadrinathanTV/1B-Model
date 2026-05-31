@@ -1,12 +1,58 @@
-# Python-generated files
+# Python-generated & build files
 __pycache__/
 *.py[oc]
 build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
 
 # Virtual environments
 .venv
+venv/
+env/
+ENV/
+
+# Datasets and Raw Data
+data/
+*.parquet
+*.jsonl
+*.jsonl.zst
+*.json.gz
+*.arrow
+*.bin
+*.npy
+*.npz
+*.pkl
+*.h5
+
+# Model weights, checkpoints, and tokenizers
+**/tokenizer/
+**/checkpoints/
+**/outputs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.model
+tokenizer.json
+
+# Logs & Monitoring
+**/logs/
+**/wandb/
+**/tb_logs/
+*.log
+
+# IDEs, Editors & System files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Project-specific ignored files
 text_extracts
 nvfp4_paper.txt

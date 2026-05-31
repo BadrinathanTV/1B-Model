@@ -3,10 +3,31 @@ name = "llm"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = "==3.12.*"
 dependencies = [
+    "accelerate>=1.13.0",
+    "datasets>=4.8.5",
+    "deepspeed>=0.19.0",
+    "nvidia-cuda-crt==13.0.88",
+    "nvidia-cuda-nvcc==13.0.88",
+    "nvidia-nvvm==13.0.88",
     "pyyaml>=6.0",
     "schedulefree>=1.4.1",
+    "tiktoken>=0.13.0",
     "torch>=2.12.0",
-    "transformer-engine>=2.15.0",
+    "torchao>=0.17.0",
+    "tqdm>=4.67.3",
+    "nvidia-cuda-cccl",
+    "nvidia-nccl-cu13",
+    "nvidia-cudnn-cu13",
+    "tree-sitter>=0.23.1",
+    "tree-sitter-python>=0.23.2",
+    "tokenizers>=0.19.0",
+    "transformers>=4.40.0",
+    "pyarrow>=15.0.0",
+    "wandb>=0.27.0",
 ]
+
+[tool.pyright]
+extraPaths = ["training", "4bit_training"]
+

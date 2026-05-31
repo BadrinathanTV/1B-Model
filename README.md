@@ -1,121 +1,194 @@
-# 1B SLM: Production-Grade Blackwell & NVFP4 Pretraining Suite
+# 1B SLM: Production-Grade Pretraining Suite
 
-A high-performance, production-grade 1.1 Billion parameter Small Language Model (SLM) architecture and pretraining pipeline optimized for NVIDIA Blackwell (SM120) architectures and consumer GPUs. It incorporates state-of-the-art architectures (Multi-Head Latent Attention, Delta Attention Residuals), training efficiency mechanisms (Token-Superposition Training, Multi-Token Prediction), and a customized high-performance hybrid optimizer suite.
-
----
-
-## Key Architectural Features
-
-### 1. Multi-Head Latent Attention (MLA)
-To resolve the key-value (KV) cache memory bottleneck during long-context inference, the model implements Decoupled MLA:
-* **KV Compression:** Compresses Keys and Values into a low-rank latent space dimension $d_c$ ($KV$ rank = 512).
-* **Decoupled RoPE:** Keeps positional embeddings separated from the compressed semantic latent space by projecting a dedicated query/key part for RoPE, which is concatenated prior to computing Scaled Dot-Product Attention (SDPA). 
-
-### 2. Delta Attention Residuals
-Replaces uniform additive residual paths with learned softmax-routed residual connections over sub-layer changes (deltas):
-* **Selective Routing:** Uses zero-initialized query parameters (`routing_q_attn`, `routing_q_ffn`) to dynamically route input tokens through past layers' deltas.
-* **Pruned History:** Supports capped delta history tracking via `max_delta_history` to prevent $O(L)$ unbounded memory accumulation in deep architectures.
-
-### 3. Token-Superposition Training (TST)
-Allows training-time sequence length compression by averaging consecutive tokens over a group size ($G$):
-* Compresses the sequence length in the embedding layer (reducing memory/flops by $G\times$).
-* Enforces strict sequence length divisibility checks to ensure exact, error-free token grouping.
-
-### 4. Multi-Token Prediction (MTP)
-An auxiliary prediction framework that predicts multiple future tokens ($t+1, t+2, \dots$) in parallel:
-* Implements stacked projection modules using a **SwiGLU** gating mechanism (`RMSNorm -> SwiGLU(gate * up) -> down` with residual skip) to prevent representation collapse.
-* Includes NaN-guards during training to gracefully bypass auxiliary loss calculation if sequences are shorter than prediction depth.
+A high-performance, production-grade pretraining suite for a **1.1 Billion Parameter Small Language Model (SLM)**. This repository contains the architecture, custom optimizers, dataset preparation pipeline, and training engines optimized for both pure `bfloat16` pretraining and legacy 4-bit block-scaled (NVFP4) training.
 
 ---
 
-## Precision & Quantization System
-
-Designed to run efficiently on SM120 (Blackwell) GPUs using NVIDIA's 4-bit block-scaled quantization (NVFP4):
-* **Precision Routing:** Automatically routes critical entry and exit blocks (configured via `high_precision_start_layers` and `high_precision_end_layers`) to run in high precision `bfloat16`/`float32` for convergence stability.
-* **Intermediate Layers:** Autocasts intermediate Transformer blocks to `NVFP4` block-scaled format.
-* **FP32 Casting:** Normalization layers (`RMSNorm`) and softmax calculations are kept in full `float32` precision to avoid underflow/overflow.
-
----
-
-## Custom Optimizer Suite
-
-The model uses a dual-optimization paradigm built from the ground up:
-
-1. **Riemannian & Vanilla Aurora:** A leverage-aware spectral optimizer for 2D rectangular matrix weights, utilizing high-quality Newton-Schulz iteration (quintic convergence) to compute balanced polar decompositions.
-2. **4-bit Quantized AdamW:** Quantizes the `exp_avg` (symmetric 4-bit, $[-7, 7]$) and `exp_avg_sq` (unsigned 4-bit, $[0, 15]$) states to save ~60% optimizer state memory for 1D biases, gains, and embeddings.
-3. **NF-Aurora:** A Schedule-Free leverage-aware spectral optimizer that eliminates learning rate decay schedule tuning while providing anytime-training capabilities.
-4. **SF-NorMuon:** Baseline schedule-free spectral optimizer used for benchmarking performance.
-
----
-
-## Repository Structure
+## 🏗️ Repository Architecture
 
 ```
 .
-├── configs/
-│   ├── default.yaml            # Default development config
-│   └── 1b_nvfp4.yaml          # Production-grade 1.1B preset
-├── layers/
-│   ├── __init__.py
-│   ├── attention.py            # Multi-Head Latent Attention
-│   ├── ffn.py                  # Feed-Forward Dense Layer
-│   ├── norm.py                 # Stable RMSNorm
-│   ├── residual.py             # Delta Attention Residual Routing
-│   └── rope.py                 # Complex precomputed RoPE
-├── models/
-│   ├── __init__.py
-│   ├── embedding.py            # TST Embedding Layer
-│   ├── mtp.py                  # MTP Head Projections
-│   └── transformer.py          # TransformerBlock and SLMModel
-├── optimizers/
-│   ├── __init__.py
-│   ├── aurora.py               # Vanilla and Riemannian Aurora
-│   ├── hybrid.py               # HybridSLMOptimizer & 4-bit AdamW
-│   ├── polar.py                # Newton-Schulz quintic polar
-│   ├── nf_aurora.py            # Schedule-free NF-Aurora
-│   ├── sf_normuon.py           # Baseline SF-NorMuon
-│   └── factory.py              # Parameter routing builder
-├── config.py                   # YAML Configuration parser
-├── train.py                    # Main pretraining script
-├── benchmark_optimizers.py     # Optimizer benchmarking suite
-└── pyproject.toml              # Dependencies and metadata
+├── training/                      # Main Pure BF16 Pretraining Package
+│   ├── configs/                   # Model and Optimizer YAML Configurations
+│   │   └── default.yaml
+│   ├── layers/                    # Custom Transformer Sub-Layers
+│   │   ├── attention.py           # Multi-Head Latent Attention (MLA)
+│   │   ├── ffn.py                 # SwiGLU Feed-Forward Network
+│   │   ├── norm.py                # Stable RMSNorm
+│   │   ├── residual.py            # Softmax-routed Delta Residuals
+│   │   └── rope.py                # Positional Embeddings & Cached RoPE
+│   ├── models/                    # Composite Model Architecture
+│   │   ├── embedding.py           # TST Embedding Layer
+│   │   ├── mtp.py                 # Multi-Token Prediction (MTP) heads
+│   │   └── transformer.py         # TransformerBlock and SLMModel
+│   ├── optimizers/                # High-Performance Optimizer Suite
+│   │   ├── kernels/               # Triton/Custom Kernels (RMSNorm, 4-bit SF-AdamW, SwiGLU)
+│   │   ├── aurora.py              # Vanilla & Riemannian Aurora
+│   │   ├── factory.py             # Shape-based Parameter Group Router
+│   │   ├── hybrid.py              # Hybrid (Aurora 2D + 4-bit AdamW 1D)
+│   │   ├── nf_aurora.py           # Schedule-Free NF-Aurora
+│   │   ├── nf_aurora_hybrid.py    # Hybrid NF-Aurora + Triton 4-bit AdamW
+│   │   ├── nf_normuon_hybrid.py   # Hybrid NF-NorMuon + Triton 4-bit AdamW
+│   │   ├── polar.py               # Compiled Newton-Schulz Polar Factors
+│   │   └── sf_normuon.py          # Schedule-Free SF-NorMuon
+│   ├── config.py                  # YAML Configuration Parser & SLMConfig dataclass
+│   ├── model.py                   # Modular exports
+│   └── train.py                   # Main BF16 Accelerate-based training script
+│
+├── 4bit_training/                 # Legacy/Alternative NVFP4 Quantized Training
+│   ├── configs/
+│   ├── layers/
+│   ├── models/
+│   ├── optimizers/
+│   ├── train.py                   # TransformerEngine NVFP4 training loop
+│   └── benchmark_optimizers.py
+│
+├── scripts/                       # Dataset Preprocessing & Tokenization
+│   ├── build_pretraining_corpus.py # Greedy corpus interleaving & AST-FIM pre-tokenization
+│   ├── download_datasets.py       # Data fetching utilities
+│   ├── experiment_tokenizers.py   # Benchmarks for tokenizer models
+│   ├── param_calc.py              # Parameter count calculator
+│   ├── run_pipeline.sh            # End-to-end pipeline run script
+│   └── train_custom_tokenizer.py  # Custom BPE tokenizer training script
+│
+├── benchmarks/                    # Layer and Kernel Performance Benchmarks
+│   ├── benchmark_kernels.py
+│   ├── benchmark_layers.py
+│   ├── benchmark_optimizer.py
+│   └── benchmark_optimizers.py
+│
+├── tests/                         # Pytest Verification Suite
+│   └── training/                  # Custom layer math & stability tests
+│
+├── models/                        # Pre-trained Tokenizers
+│   ├── tokenizer/
+│   ├── tokenizer_hybrid.json
+│   ├── tokenizer_llama.json
+│   └── tokenizer_sarvam.json
+│
+├── pyproject.toml                 # Package Metadata & Dependency Management
+└── uv.lock                        # Lockfile for reproducible environment installs
 ```
 
 ---
 
-## Getting Started
+## 🚀 Pretraining Pipeline Workflow
 
-### 1. Prerequisites & Installation
-This project requires Python 3.10+ and a CUDA-enabled GPU (Blackwell RTX 5080/5090 or Hopper/Ada Lovelace architectures for NVFP4 acceleration).
+```mermaid
+graph TD
+    A[scripts/download_datasets.py] -->|1. Fetch Raw Corpora| B[Data Cache]
+    C[scripts/train_custom_tokenizer.py] -->|2. Build Vocab| D[Custom Tokenizer]
+    B & D --> E[scripts/build_pretraining_corpus.py]
+    E -->|3. AST-FIM Pre-tokenization & Interleaving| F[memmapped .bin chunks]
+    F --> G[training/train.py]
+    G -->|4. BF16 Accelerate Loop + Custom Optimizers| H[Pretrained 1B Model Checkpoint]
+```
 
-Install package dependencies using uv:
+---
+
+## 💎 Core Architecture Features (`training/layers/` & `training/models/`)
+
+### 1. Multi-Head Latent Attention (MLA)
+Implemented in [attention.py](file:///home/badrinathan-tv/Desktop/Projects/1B-Model/training/layers/attention.py). To alleviate the key-value (KV) cache memory bottleneck during inference:
+* **KV Compression:** Compresses Keys and Values into a low-rank latent space ($d_c = 256$).
+* **Decoupled RoPE:** Positions and semantics are decoupled; RoPE coordinates are projected separately and concatenated prior to Scaled Dot-Product Attention (SDPA).
+
+### 2. Softmax-Routed Delta Attention Residuals
+Implemented in [residual.py](file:///home/badrinathan-tv/Desktop/Projects/1B-Model/training/layers/residual.py). Replaces standard uniform residual streams:
+* **Selective Delta Routing:** Dynamically routes tokens through prior layers' sub-layer changes (deltas) using zero-initialized query parameters (`routing_q_attn`, `routing_q_ffn`).
+* **Context Capping:** Protects memory overhead by enforcing `max_delta_history` to drop aged delta tensors from the history buffer.
+
+### 3. Token-Superposition Training (TST)
+Implemented in [embedding.py](file:///home/badrinathan-tv/Desktop/Projects/1B-Model/training/models/embedding.py). Achieves training sequence length compression:
+* **Sequence Compressing:** Averages consecutive tokens over a group size ($G$) at the embedding layer, reducing training sequence length and FLOPs by $G\times$.
+* **Divisibility Guard:** Checks sequence length bounds to guarantee exact grouping without token truncation.
+
+### 4. Multi-Token Prediction (MTP)
+Implemented in [mtp.py](file:///home/badrinathan-tv/Desktop/Projects/1B-Model/training/models/mtp.py). Auxiliary prediction framework for multi-step future token predictions:
+* **SwiGLU Gating:** Employs gated projections (`RMSNorm -> SwiGLU(gate * up) -> down` with residual skip) to avoid representation collapse when stacking prediction heads.
+
+---
+
+## ⚡ Custom Optimizer Suite (`training/optimizers/`)
+
+Parameters are routed automatically based on their dimension:
+* **1D parameters, embeddings, and normalization gains** are routed to **4-bit Quantized AdamW** to save $\approx 60\%$ optimizer state memory.
+* **2D matrix weights** are routed to **Spectral Optimizers** (Aurora, NorMuon) for balanced singular value training.
+
+| Optimizer | Type | State Memory | Math / Characteristics |
+|---|---|---|---|
+| **Riemannian Aurora** | Spectral | Momentum only | Leverage-aware polar decomposition via quintic Newton-Schulz iteration. |
+| **4-bit Quantized AdamW** | Step-wise | 4-bit compressed | symmetric 4-bit `exp_avg` $[-7, 7]$, unsigned 4-bit `exp_avg_sq` $[0, 15]$. |
+| **NF-Aurora** | Schedule-Free | Leverage-aware | Horizon-free training, combines Schedule-Free dynamics with Aurora's polar factor updates. |
+| **SF-NorMuon** | Schedule-Free | Row-wise EMA | Combines Polar Express (PE-8) and row-wise normalization for 2D weights with AdamC Polyak for 1D. |
+
+> [!NOTE]
+> Custom CUDA/Triton kernels are provided in [kernels/](file:///home/badrinathan-tv/Desktop/Projects/1B-Model/training/optimizers/kernels) for high-efficiency implementations of **Schedule-Free AdamW 4-bit**, **RMSNorm**, and **SwiGLU**.
+
+---
+
+## ⚙️ Main Training Configuration (`training/config.py`)
+
+YAML configurations define both structural settings and optimizer choices:
+```yaml
+model:
+  vocab_size: 64000
+  hidden_size: 1536
+  num_hidden_layers: 24
+  num_attention_heads: 12
+  intermediate_size: 4096
+  max_position_embeddings: 4096
+  tst_group_size: 2
+  mtp_depth: 2
+
+optimizer:
+  type: "hybrid" # Options: "hybrid", "nf_aurora", "sf_normuon", "adamw"
+  base_lr: 1.0e-3
+  warmup_steps: 2000
+
+training:
+  batch_size: 2
+  seq_len: 512
+  max_steps: 10000
+  gradient_accumulation_steps: 8
+```
+
+---
+
+## 🚦 Getting Started
+
+### 1. Environment Setup
+Install dependencies and build the virtual environment using `uv`:
 ```bash
-# Setup virtual environment and install dependencies
+# Setup virtual environment and sync packages
 uv venv
 source .venv/bin/activate
 uv pip install -e .
 ```
 
-To run with NVFP4 hardware acceleration, ensure NVIDIA Transformer Engine (`transformer_engine`) is installed. The codebase falls back to standard precision when `transformer_engine` is unavailable.
-
-### 2. Configuration Options
-Configurations are managed via YAML files:
-* **Model Configuration:** Setup vocab size, hidden dimensions, layer count, MLA rank, TST group sizes, and MTP prediction depth.
-* **Optimizations:** Enable/disable weight tying (`tie_word_embeddings`) and limit delta residual context length (`max_delta_history`).
-* **Optimizer Configuration:** Route between `hybrid`, `nf_aurora`, or standard `adamw`.
-
-### 3. Launching Pretraining
-Run the training script with your target configuration:
+### 2. Run the Corpus and Pretraining Pipeline
+The end-to-end training pipeline is managed by [run_pipeline.sh](file:///home/badrinathan-tv/Desktop/Projects/1B-Model/scripts/run_pipeline.sh):
 ```bash
-# Launch with default configuration (24 layers, hybrid optimizer)
-python train.py --config configs/default.yaml
-
-# Launch production-grade 1B NVFP4 training run
-python train.py --config configs/1b_nvfp4.yaml
+# Executing tokenizer tests, dataset preprocessing, and launching the pretraining run
+bash scripts/run_pipeline.sh
 ```
 
-### 4. Running Benchmarks
-Benchmark optimizer convergence on Mini-GPT:
+Or run steps individually:
 ```bash
-python benchmark_optimizers.py --steps 1000 --device cuda
+# 1. Download and build the AST-FIM pretraining corpus
+python scripts/build_pretraining_corpus.py
+
+# 2. Launch the main BF16 Accelerate-based training loop
+python training/train.py --config training/configs/default.yaml
+```
+
+### 3. Running Verification Tests & Benchmarks
+Ensure the layers and custom optimizers behave as expected mathematically:
+```bash
+# Run pytest verification
+pytest tests/
+
+# Benchmark custom layers and kernel speeds
+python benchmarks/benchmark_kernels.py
+python benchmarks/benchmark_layers.py
 ```
