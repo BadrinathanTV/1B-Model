@@ -67,6 +67,8 @@ class TrainingConfig:
     max_steps: int = 5
     gradient_accumulation_steps: int = 8
     mtp_loss_weight: float = 0.3
+    mtp_loss_weight_final: float = 0.1     # Anneal MTP weight to this value
+    mtp_anneal_fraction: float = 0.67      # Fraction of training to start annealing
     gradient_clip: float = 1.0
     log_interval: int = 1
     seed: int = 42
@@ -103,15 +105,41 @@ class SLMConfig:
     v_head_dim: int = 128
     rope_theta: float = 10000.0
 
-    # TST (Token Superposition Training)
+    # YaRN Context Extension
+    use_yarn: bool = False             # Enable YaRN RoPE scaling
+    yarn_scale_factor: float = 1.0     # Context scale (e.g. 16.0 for 32k if trained on 2k)
+    yarn_original_context: int = 2048  # Original pre-training max context
+    yarn_beta_fast: float = 32.0       # YaRN beta fast (high frequency cutoff)
+    yarn_beta_slow: float = 1.0        # YaRN beta slow (low frequency cutoff)
+
+    # TST (Token Superposition Training) — Two-Phase
+    #   Phase 1 (Superposition): MCE loss on bags of tst_group_size tokens
+    #   Phase 2 (Recovery): Standard next-token prediction (tst_group_size→1)
     tst_group_size: int = 2
+    tst_superposition_ratio: float = 0.3  # Fraction of max_steps in superposition phase (paper: 20-40%)
 
     # MTP (Multi-Token Prediction)
     mtp_depth: int = 2
+    use_mtp: bool = True
+
+    # Stability: Weight Initialization
+    init_std: float = 0.02             # Truncated normal sigma (DeepSeek-V3 uses 0.006)
+
+    # Stability: Z-Loss (logit regularization)
+    z_loss_weight: float = 1e-4        # Penalty on logit magnitude (PaLM/Gemma style)
+
+    # Stability: Embedding scaling
+    embed_scale: bool = True           # Multiply embeddings by sqrt(hidden_size)
+
+    # Stability: Output head logit scaling / temperature
+    output_logit_scale: float = 1.0    # Additional scale factor for output logits
+    output_logit_scale_trainable: bool = False # Make the scale factor a trainable parameter
 
     # Weight Tying & Memory Optimizations
     tie_word_embeddings: bool = True
     max_delta_history: int = 0  # 0 means keep full history
+    gradient_checkpointing: bool = True # Set to False for massive speedup if VRAM allows
+    gradient_checkpointing_interval: int = 1 # Checkpoint every N layers (higher = faster but more memory)
 
     # Sub-configs
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -140,6 +168,8 @@ class SLMConfig:
             raise ValueError(f"tst_group_size must be >= 1, got {self.tst_group_size}")
         if self.mtp_depth < 1:
             raise ValueError(f"mtp_depth must be >= 1, got {self.mtp_depth}")
+        if self.output_logit_scale <= 0.0:
+            raise ValueError(f"output_logit_scale must be positive, got {self.output_logit_scale}")
         if self.max_delta_history < 0:
             raise ValueError(f"max_delta_history must be >= 0, got {self.max_delta_history}")
 

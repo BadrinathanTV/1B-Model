@@ -75,7 +75,6 @@ def polar_compiled(G: torch.Tensor, steps: int = 12, eps: float = 1e-7) -> torch
         X = X.mT
     return X
 
-@torch.compile
 def polar_fast(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
     """Fast Newton-Schulz with aggressive NorMuon coefficients.
 
@@ -98,8 +97,10 @@ def polar_fast(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tens
     a, b, c = 3.4445, -4.7750, 2.0315
     for _ in range(steps):
         A = X @ X.mT
-        B = b * A + c * A @ A
-        X = a * X + B @ X
+        # Fused operations: B = b*A + c*(A@A)
+        B = torch.addmm(A, A, A, beta=b, alpha=c)
+        # Fused operations: X = a*X + B@X
+        X = torch.addmm(X, B, X, beta=a, alpha=1.0)
 
     if G.size(0) > G.size(1):
         X = X.mT

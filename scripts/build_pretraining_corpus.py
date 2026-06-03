@@ -25,9 +25,10 @@ DOMAINS = {
 FIM_RATE_CODE = 0.70
 AST_FIM_RATIO = 0.90 # 90% of FIM is AST-FIM, 10% is random
 
-def stream_folder(folder_path):
+def stream_folder(folder_path, skip_patterns=None):
     """Safely stream text from a folder without loading everything into memory."""
     for f in glob.glob(os.path.join(folder_path, "**", "*.txt"), recursive=True):
+        if skip_patterns and any(p in f for p in skip_patterns): continue
         try:
             with open(f, 'r', encoding='utf-8') as file:
                 for line in file:
@@ -36,6 +37,7 @@ def stream_folder(folder_path):
         except Exception: pass
 
     for f in glob.glob(os.path.join(folder_path, "**", "*.parquet"), recursive=True):
+        if skip_patterns and any(p in f for p in skip_patterns): continue
         try:
             schema = pq.read_schema(f)
             col_name = 'text' if 'text' in schema.names else 'content'
@@ -46,6 +48,7 @@ def stream_folder(folder_path):
         except Exception: pass
 
     for f in glob.glob(os.path.join(folder_path, "**", "*.json.gz"), recursive=True):
+        if skip_patterns and any(p in f for p in skip_patterns): continue
         try:
             with gzip.open(f, 'rt', encoding='utf-8') as file:
                 for line in file:
@@ -134,7 +137,7 @@ def chunk_iterator(iterator, size):
     if chunk:
         yield chunk
 
-def build_corpus(samples_per_domain=2000000, chunk_size=10000):
+def build_corpus(samples_per_domain=float('inf'), chunk_size=3000, resume=True):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     print("Loading Tokenizer...")
@@ -143,11 +146,21 @@ def build_corpus(samples_per_domain=2000000, chunk_size=10000):
     # Generate tasks
     def task_generator():
         for domain, folders in DOMAINS.items():
+            if resume and domain in ["tamil", "code"]:
+                continue
             yielded = 0
             for folder in folders:
+                if resume and folder == "finemath":
+                    continue
                 folder_path = os.path.join(BASE_DIR, folder)
                 if not os.path.exists(folder_path): continue
-                for text in stream_folder(folder_path):
+                
+                skip_patterns = None
+                if resume and folder == "pes2o":
+                    # skip train-00000 to train-00013
+                    skip_patterns = [f"train-{i:05d}" for i in range(14)]
+                    
+                for text in stream_folder(folder_path, skip_patterns):
                     yield (text, domain)
                     yielded += 1
                     if yielded >= samples_per_domain:
@@ -156,9 +169,10 @@ def build_corpus(samples_per_domain=2000000, chunk_size=10000):
                     break
 
     print("Starting Multiprocessing Pipeline...")
-    pool = mp.Pool(processes=14)
+    # Set processes=8 and chunk_size=3000 to guarantee stability and prevent OOM killer
+    pool = mp.Pool(processes=8)
     
-    file_idx = 0
+    file_idx = 149 if resume else 0
     MAX_TOKENS_PER_FILE = 250_000_000 # ~500MB per bin file
     
     buffer = np.zeros(MAX_TOKENS_PER_FILE, dtype=np.uint16)

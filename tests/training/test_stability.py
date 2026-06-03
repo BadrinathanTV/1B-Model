@@ -77,6 +77,9 @@ class TestSLMStabilitySuite(unittest.TestCase):
             # Disable the latent RMSNorms by replacing them with Identity
             mla_degraded.q_norm = nn.Identity()
             mla_degraded.kv_norm = nn.Identity()
+            # Disable QK-Norm on heads as well so attention logits explode
+            mla_degraded.q_head_norm = nn.Identity()
+            mla_degraded.k_head_norm = nn.Identity()
 
             observed_max_logit.clear()
             # Bypassing pre-norm for the degraded case to show how quickly it explodes without BOTH protections

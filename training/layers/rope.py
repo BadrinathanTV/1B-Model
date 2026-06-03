@@ -15,36 +15,60 @@ except ImportError:
     LIGER_ROPE = False
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device: torch.device = None) -> torch.Tensor:
-    """Precompute the complex exponential freqs_cis for rotary position embeddings.
-    
-    Args:
-        dim: Dimension of the rotary embedding (must be even).
-        end: Maximum sequence length.
-        theta: Frequency scale factor.
-        device: Target device for computation and storage.
-        
-    Returns:
-        freqs_cis: Complex tensor of shape [end, dim // 2].
-    """
-    assert dim % 2 == 0, "RoPE dimension must be even"
+import math
+
+def _compute_yarn_freqs(dim: int, theta: float, scale: float, beta_fast: float, beta_slow: float, original_context: int, device: torch.device):
+    """Compute YaRN (Yet another RoPE extensioN) inverse frequencies and attention scale."""
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
+    
+    if scale <= 1.0:
+        return freqs, 1.0
+
+    # Find the interpolation ranges
+    def find_correction_dim(num_rotations):
+        return (dim * math.log(original_context / (num_rotations * 2 * math.pi))) / (2 * math.log(theta))
+    
+    low = max(math.floor(find_correction_dim(beta_fast)), 0)
+    high = min(math.ceil(find_correction_dim(beta_slow)), dim - 1)
+    
+    # Calculate linear ramp mask
+    inv_freq_mask = torch.arange(0, dim, 2, dtype=torch.float32, device=device)
+    inv_freq_mask = 1.0 - (inv_freq_mask - low) / max(high - low, 1e-4)
+    inv_freq_mask = torch.clamp(inv_freq_mask, 0.0, 1.0)
+    
+    # Apply piece-wise interpolation
+    freqs_interp = freqs / scale
+    freqs_yarn = freqs * inv_freq_mask + freqs_interp * (1.0 - inv_freq_mask)
+    
+    # Calculate temperature scale for attention logits (we scale cos/sin by sqrt(t) so Q*K gets scaled by t)
+    # The paper uses t = 0.1 * ln(s) + 1.0
+    mscale = float(0.1 * math.log(scale) + 1.0)
+    
+    return freqs_yarn, mscale
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device: torch.device = None,
+                         yarn_scale: float = 1.0, yarn_beta_fast: float = 32.0, yarn_beta_slow: float = 1.0, yarn_orig_ctx: int = 2048) -> torch.Tensor:
+    """Precompute the complex exponential freqs_cis for rotary position embeddings."""
+    assert dim % 2 == 0, "RoPE dimension must be even"
+    freqs, mscale = _compute_yarn_freqs(dim, theta, yarn_scale, yarn_beta_fast, yarn_beta_slow, yarn_orig_ctx, device)
+    
     t = torch.arange(end, device=device, dtype=torch.float32)
-    freqs = torch.outer(t, freqs) # [end, dim // 2]
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs) # Complex tensor
+    angles = torch.outer(t, freqs) # [end, dim // 2]
+    
+    # Scale amplitude by mscale so dot products are scaled by mscale^2
+    freqs_cis = torch.polar(torch.ones_like(angles) * mscale, angles) # Complex tensor
     return freqs_cis
 
 
-def precompute_cos_sin(dim: int, end: int, theta: float = 10000.0, device: torch.device = None, dtype=torch.bfloat16):
-    """Precompute cos/sin caches for Liger RoPE kernel.
+def precompute_cos_sin(dim: int, end: int, theta: float = 10000.0, device: torch.device = None, dtype=torch.bfloat16,
+                       yarn_scale: float = 1.0, yarn_beta_fast: float = 32.0, yarn_beta_slow: float = 1.0, yarn_orig_ctx: int = 2048):
+    """Precompute cos/sin caches for Liger RoPE kernel."""
+    freqs, mscale = _compute_yarn_freqs(dim, theta, yarn_scale, yarn_beta_fast, yarn_beta_slow, yarn_orig_ctx, device)
     
-    Returns:
-        cos_cache, sin_cache: Tensors of shape [end, dim // 2].
-    """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
     t = torch.arange(end, device=device, dtype=torch.float32)
     angles = torch.outer(t, freqs)
-    return angles.cos().to(dtype), angles.sin().to(dtype)
+    
+    return (angles.cos() * mscale).to(dtype), (angles.sin() * mscale).to(dtype)
 
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Tensor:

@@ -80,11 +80,11 @@ class TestMTPModule(unittest.TestCase):
         seq_len = 8
         x = torch.randn(batch_size, seq_len, self.config.hidden_size)
         
-        logits_list = mtp(x, use_mtp=True)
+        hidden_states_list = mtp.forward_hidden(x, use_mtp=True)
         targets = torch.randint(0, self.config.vocab_size, (batch_size, seq_len))
         
         # Should compute loss successfully without shape crashes
-        loss = compute_loss(logits_list, targets, self.config)
+        loss, _ = compute_loss(hidden_states_list, targets, self.lm_head.weight, self.config, 0)
         self.assertTrue(loss.item() > 0)
 
     def test_loss_computation_mtp_disabled(self):
@@ -93,11 +93,11 @@ class TestMTPModule(unittest.TestCase):
         seq_len = 8
         x = torch.randn(batch_size, seq_len, self.config.hidden_size)
         
-        logits_list = mtp(x, use_mtp=False)
+        hidden_states_list = mtp.forward_hidden(x, use_mtp=False)
         targets = torch.randint(0, self.config.vocab_size, (batch_size, seq_len))
         
         # Should compute loss successfully even if MTP is disabled (only main logits used)
-        loss = compute_loss(logits_list, targets, self.config)
+        loss, _ = compute_loss(hidden_states_list, targets, self.lm_head.weight, self.config, 0)
         self.assertTrue(loss.item() > 0)
 
 class TestMTPIntegration(unittest.TestCase):
@@ -125,9 +125,9 @@ class TestMTPIntegration(unittest.TestCase):
         cos_cache, sin_cache = precompute_cos_sin(config.qk_rope_head_dim, config.training.seq_len, config.rope_theta, inputs.device)
         
         # Case 1: MTP enabled end-to-end
-        logits_mtp = model(inputs, freqs_cis=freqs_cis, cos_cache=cos_cache, sin_cache=sin_cache, use_mtp=True)
-        self.assertEqual(len(logits_mtp), 3)
-        loss_mtp = compute_loss(logits_mtp, targets, config)
+        hidden_states_mtp = model(inputs, freqs_cis=freqs_cis, cos_cache=cos_cache, sin_cache=sin_cache, use_mtp=True, return_hidden_states=True)
+        self.assertEqual(len(hidden_states_mtp), 3)
+        loss_mtp, _ = compute_loss(hidden_states_mtp, targets, model.lm_head.weight, config, 0)
         loss_mtp.backward()
         self.assertIsNotNone(model.embed.word_embeddings.weight.grad)
         
@@ -135,9 +135,9 @@ class TestMTPIntegration(unittest.TestCase):
         model.zero_grad()
         
         # Case 2: MTP disabled end-to-end
-        logits_nomtp = model(inputs, freqs_cis=freqs_cis, cos_cache=cos_cache, sin_cache=sin_cache, use_mtp=False)
-        self.assertEqual(len(logits_nomtp), 1)
-        loss_nomtp = compute_loss(logits_nomtp, targets, config)
+        hidden_states_nomtp = model(inputs, freqs_cis=freqs_cis, cos_cache=cos_cache, sin_cache=sin_cache, use_mtp=False, return_hidden_states=True)
+        self.assertEqual(len(hidden_states_nomtp), 1)
+        loss_nomtp, _ = compute_loss(hidden_states_nomtp, targets, model.lm_head.weight, config, 0)
         loss_nomtp.backward()
         self.assertIsNotNone(model.embed.word_embeddings.weight.grad)
 

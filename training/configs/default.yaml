@@ -5,7 +5,7 @@
 #   python training/train.py --config training/configs/default.yaml
 # ─── Model Architecture ──────────────────────────────────────────────────────
 model:
-  vocab_size: 64000
+  vocab_size: 65536
   hidden_size: 1280              # Reduced from 2048 for 16GB VRAM budget
   num_hidden_layers: 24
   num_attention_heads: 10        # 1280 / 128 = 10 heads
@@ -21,19 +21,35 @@ model:
   rope_theta: 10000.0
 
   # TST (Token Superposition Training)
-  tst_group_size: 2
+  tst_group_size: 4
 
   # MTP (Multi-Token Prediction)
   mtp_depth: 2
+  use_mtp: true
+
+  # Stability: Weight Initialization (DeepSeek-V3 uses 0.006; 1/√1280 ≈ 0.028)
+  init_std: 0.02
+
+  # Stability: Z-Loss regularization (PaLM/Gemma style)
+  z_loss_weight: 1.0e-4
+
+  # Stability: Embedding scaling by √hidden_size
+  embed_scale: true
+
+  # Stability: Output Head Scaling & Logit Temperature
+  output_logit_scale: 1.0
+  output_logit_scale_trainable: false
 
   # Weight Tying & Memory Optimizations
   tie_word_embeddings: true
   max_delta_history: 8
+  gradient_checkpointing: true
+  gradient_checkpointing_interval: 1
 
 # ─── Optimizer ────────────────────────────────────────────────────────────────
 optimizer:
   type: "sf_normuon"
-  base_lr: 0.01 # Polyak relies on a relatively large base LR
+  base_lr: 1.0 # ScheduleFree+ is learning-rate-free; base_lr defaults to 1.0
   warmup_steps: 1250 # c_warmup will automatically be 2500
 
   aurora:
@@ -47,12 +63,14 @@ optimizer:
 
 # ─── Training ─────────────────────────────────────────────────────────────────
 training:
-  batch_size: 4 # per GPU
-  gradient_accumulation_steps: 512
-  seq_len: 2048 # (4 * 512 * 2048 = 4.19M tokens global batch size)
-  max_steps: 50000
+  batch_size: 20 # per GPU (middle ground between 16 and 24 for optimal VRAM utilization)
+  gradient_accumulation_steps: 102
+  seq_len: 1024 # (4 * 512 * 4096 = 8.38M tokens global batch size per step with TST=4)
+  max_steps: 5960
   mtp_loss_weight: 0.3
+  mtp_loss_weight_final: 0.1         # Anneal to this after mtp_anneal_fraction of training
+  mtp_anneal_fraction: 0.67          # DeepSeek-V3: anneal at 67% of total steps
   gradient_clip: 1.0
-  log_interval: 100
+  log_interval: 1
   seed: 42
   device: "auto"

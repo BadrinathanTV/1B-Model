@@ -1,7 +1,36 @@
 import math
 import torch
 import torch.distributed as dist
-from .polar import polar_pe8
+from .polar import polar_fast
+
+
+@torch.compile
+def _compute_ip_term(grad, z, x, sf_beta1_k):
+    """Fuses inner product subtraction and reduction to eliminate allocations."""
+    return sf_beta1_k * torch.sum(grad * (z - x))
+
+
+@torch.compile
+def _update_vt_and_get_denom(Pt, vt, beta2, eps):
+    """Fuses vt EMA update, sqrt, and eps addition into a single kernel."""
+    Pt_sq = Pt.pow(2)
+    meancols = Pt_sq.mean(dim=1, keepdim=True)
+    vt.mul_(beta2).add_(meancols, alpha=1 - beta2)
+    return vt.sqrt() + eps
+
+
+@torch.compile
+def _update_1d_param(z, y, grad, exp_avg, exp_avg_sq, beta1, beta2, bias_correction1, bias_correction2, group_lr, decay, eps):
+    """Fuses the entire AdamC 1D update into a single kernel with zero allocations."""
+    if decay > 0:
+        z.add_(y, alpha=-decay * group_lr * group_lr)
+    
+    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+    
+    denom = (exp_avg_sq / bias_correction2).sqrt_().add_(eps)
+    step = (exp_avg / bias_correction1) * group_lr / denom
+    z.sub_(step)
 
 
 class SFNorMuon(torch.optim.Optimizer):
@@ -56,11 +85,14 @@ class SFNorMuon(torch.optim.Optimizer):
         if not self.param_groups[0]['train_mode']:
             raise Exception("Optimizer must be in train mode.")
         
+        device = self.param_groups[0]['params'][0].device
         function_value = None
         if closure is not None:
             function_value = closure()
         if function_value is None:
-            function_value = 0.0 # Fallback
+            function_value = torch.tensor(0.0, device=device)
+        elif not isinstance(function_value, torch.Tensor):
+            function_value = torch.tensor(float(function_value), device=device)
             
         group0 = self.param_groups[0]
         grad_l1_ema = group0['grad_l1_ema']
@@ -78,39 +110,58 @@ class SFNorMuon(torch.optim.Optimizer):
 
         grad_l1_list = []
         ip_term_list = []
+        is_distributed = False
         
         for group in self.param_groups:
             for p in group['params']:
                 if p.grad is None: continue
                 grad = p.grad.data
-                grad_l1_list.append(torch.linalg.vector_norm(grad, ord=1))
+                
+                if hasattr(grad, 'to_local'):
+                    is_distributed = True
+                    local_grad = grad.to_local()
+                else:
+                    local_grad = grad
+                    
+                grad_l1_list.append(torch.linalg.vector_norm(local_grad, ord=1))
                 state = self.state[p]
                 if 'z' in state:
-                    ip_term_list.append(sf_beta1_k * (grad.mul(state['z'] - state['x'])).sum())
+                    z = state['z']
+                    x = state['x']
+                    local_z = z.to_local() if hasattr(z, 'to_local') else z
+                    local_x = x.to_local() if hasattr(x, 'to_local') else x
+                    ip_term_list.append(_compute_ip_term(local_grad, local_z, local_x, sf_beta1_k))
                     
-        grad_l1 = torch.stack(grad_l1_list).sum() if grad_l1_list else torch.tensor(0.0, device=self.param_groups[0]['params'][0].device)
-        ip_term = torch.stack(ip_term_list).sum() if ip_term_list else torch.tensor(0.0, device=self.param_groups[0]['params'][0].device)
+        grad_l1 = torch.stack(grad_l1_list).sum() if grad_l1_list else torch.tensor(0.0, device=device)
+        ip_term = torch.stack(ip_term_list).sum() if ip_term_list else torch.tensor(0.0, device=device)
         
-        if dist.is_available() and dist.is_initialized():
+        if is_distributed and dist.is_available() and dist.is_initialized():
             dist.all_reduce(grad_l1, op=dist.ReduceOp.SUM)
             dist.all_reduce(ip_term, op=dist.ReduceOp.SUM)
-            dist_tensor = torch.zeros(1, device=grad_l1.device)
+            dist_tensor = torch.zeros(1, device=device)
             dist_tensor[0] = function_value
             dist.all_reduce(dist_tensor, op=dist.ReduceOp.AVG)
-            global_function_value = dist_tensor[0].item()
+            global_function_value = dist_tensor[0]
         else:
-            global_function_value = float(function_value)
+            global_function_value = function_value
             
-        grad_l1 = grad_l1.item()
-        ip_term = ip_term.item()
+        # Keep everything on GPU to avoid CPU-GPU syncs!
+        if not isinstance(group0['grad_l1_ema'], torch.Tensor):
+            group0['grad_l1_ema'] = torch.tensor(group0['grad_l1_ema'], device=device)
+        grad_l1_ema = group0['grad_l1_ema']
         
-        grad_l1_ema = polyak_beta * grad_l1_ema + (1 - polyak_beta) * grad_l1 * math.sqrt(math.pi / 2)
-        grad_l1_ema_corr = grad_l1_ema / (1 - polyak_beta ** (k + 1)) if polyak_beta > 0 else grad_l1 * math.sqrt(math.pi / 2)
+        grad_l1_ema.mul_(polyak_beta).add_(grad_l1, alpha=(1 - polyak_beta) * math.sqrt(math.pi / 2))
         
-        if grad_l1_ema_corr == 0:
-            polyak_lr = 1.0
+        if polyak_beta > 0:
+            grad_l1_ema_corr = grad_l1_ema / (1 - polyak_beta ** (k + 1))
         else:
-            polyak_lr = max(0.0, global_function_value + ip_term) / grad_l1_ema_corr
+            grad_l1_ema_corr = grad_l1 * math.sqrt(math.pi / 2)
+        
+        polyak_lr = torch.where(
+            grad_l1_ema_corr == 0,
+            torch.ones_like(grad_l1_ema_corr),
+            torch.clamp(global_function_value + ip_term, min=0.0) / grad_l1_ema_corr
+        )
             
         for group in self.param_groups:
             eps = group['eps']
@@ -126,14 +177,19 @@ class SFNorMuon(torch.optim.Optimizer):
             group_lr = lr * polyak_lr
             group['grad_l1_ema'] = grad_l1_ema
             group['scheduled_lr'] = group_lr
-            lr_max = group['lr_max'] = max(group_lr, group['lr_max'])
+            
+            if not isinstance(group['lr_max'], torch.Tensor):
+                group['lr_max'] = torch.tensor(group['lr_max'], device=device)
+            lr_max = group['lr_max'] = torch.maximum(group_lr, group['lr_max'])
             
             if k < c_warmup:
                 ckp1 = 1.0
             else:
                 weight = ((k + 1) ** r) * (lr_max ** weight_lr_power)
-                weight_sum = group['weight_sum'] = group['weight_sum'] + weight
-                ckp1 = weight / weight_sum
+                if not isinstance(group['weight_sum'], torch.Tensor):
+                    group['weight_sum'] = torch.tensor(group['weight_sum'], device=device)
+                group['weight_sum'] = group['weight_sum'] + weight
+                ckp1 = weight / group['weight_sum']
                 
             for p in group['params']:
                 if p.grad is None: continue
@@ -159,52 +215,47 @@ class SFNorMuon(torch.optim.Optimizer):
                     mom = state['mom']
                     vt = state['vt']
                     
-                    # Weight decay applied directly on Z
+                    # Weight decay applied directly on Z at point y via fused add_
                     if decay > 0:
-                        z.sub_(z, alpha=group_lr * decay)
+                        z.add_(y, alpha=-decay * group_lr * group_lr)
                     
                     # Explicit momentum before polar
                     mom.mul_(beta1).add_(grad, alpha=1 - beta1)
                     
-                    # Spectral Step via Polar Express
-                    Pt = polar_pe8(mom, eps)
+                    # Spectral Step via fast Newton-Schulz
+                    Pt = polar_fast(mom, eps=eps)
                     
-                    # Row-wise EMA normalization
-                    Pt_sq = Pt.pow(2)
-                    meancols = Pt_sq.mean(dim=1, keepdim=True)
-                    vt.mul_(beta2).add_(meancols, alpha=1 - beta2)
+                    # In-place update vt and get denom
+                    P_hat_denom = _update_vt_and_get_denom(Pt, vt, beta2, eps)
                     
-                    P_hat = Pt / (vt.sqrt() + eps)
+                    # In-place division: Pt becomes P_hat
+                    Pt.div_(P_hat_denom)
+                    Pt_norm = Pt.norm().clamp(min=1e-12)
                     
                     # Global scaling to match Adam RMS scale
                     m, n = p.shape
-                    P_hat_norm = P_hat.float().norm().item()
-                    eta_hat = eta_scale * group_lr * max(m, n) / max(1e-12, P_hat_norm)
+                    step_size = group_lr * (-eta_scale * math.sqrt(m * n))
+                    step_size_scaled = step_size / Pt_norm
                     
-                    z.sub_(P_hat, alpha=eta_hat)
+                    # Update z with zero extra matrix allocations
+                    z.add_(Pt, alpha=step_size_scaled)
                 else:
-                    # AdamC Polyak for 1D
+                    # AdamC Polyak for 1D (Fully compiled & zero-allocation helper)
                     exp_avg = state['exp_avg']
                     exp_avg_sq = state['exp_avg_sq']
-                    
-                    # Fully decoupled AdamC weight decay on Z
-                    if decay > 0:
-                        z.sub_(z, alpha=group_lr * decay)
                     
                     bias_correction1 = 1 - beta1 ** (k + 1)
                     bias_correction2 = 1 - beta2 ** (k + 1)
                     
-                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                    exp_avg_corr = exp_avg.div(bias_correction1)
+                    _update_1d_param(
+                        z, y, grad, exp_avg, exp_avg_sq,
+                        beta1, beta2, bias_correction1, bias_correction2,
+                        group_lr, decay, eps
+                    )
                     
-                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-                    denom = exp_avg_sq.div(bias_correction2).sqrt_().add_(eps)
-                    
-                    z.addcdiv_(exp_avg_corr, denom, value=-group_lr)
-                    
-                # Schedule-Free Extrapolation
-                x.mul_(1 - ckp1).add_(z, alpha=ckp1)
-                y.copy_(x.mul(sf_beta1_k).add_(z, alpha=1 - sf_beta1_k))
+                # Schedule-Free Extrapolation (Zero allocations)
+                x.mul_(1.0 - ckp1).add_(z, alpha=ckp1)
+                y.copy_(x).mul_(sf_beta1_k).add_(z, alpha=1.0 - sf_beta1_k)
                 p.detach().copy_(y)
                 
             group['k'] = k + 1

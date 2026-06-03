@@ -35,6 +35,13 @@ class MultiHeadLatentAttention(nn.Module):
         
         # Output projection
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=False)
+
+        # QK-Norm: per-head normalization to prevent attention entropy collapse
+        qk_head_dim = self.v_head_dim + self.qk_rope_head_dim
+        # Disable Triton for this specific norm: Triton forces a 2D reshape which launches
+        # 122,880 tiny thread blocks per layer. PyTorch handles this 4D reduction much faster.
+        self.q_head_norm = RMSNorm(qk_head_dim, config.rms_norm_eps, use_triton=False)
+        self.k_head_norm = RMSNorm(qk_head_dim, config.rms_norm_eps, use_triton=False)
         
     def forward(self, x, freqs_cis=None, cos_cache=None, sin_cache=None):
         batch_size, seq_len, _ = x.shape
@@ -67,11 +74,15 @@ class MultiHeadLatentAttention(nn.Module):
         # Concatenate RoPE dimensions and regular latent dimensions
         q_full = torch.cat([q, q_rope], dim=-1)
         k_full = torch.cat([k, k_rope], dim=-1)
+
+        # QK-Norm: normalize per-head before SDPA (after RoPE concat)
+        q_full = self.q_head_norm(q_full)
+        k_full = self.k_head_norm(k_full)
         
-        # Transpose for SDPA: (batch, heads, seq, dim)
-        q_full = q_full.transpose(1, 2)
-        k_full = k_full.transpose(1, 2)
-        v = v.transpose(1, 2)
+        # Transpose for SDPA and ensure memory is contiguous for FlashAttention speed
+        q_full = q_full.transpose(1, 2).contiguous()
+        k_full = k_full.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
         
         # Use cuDNN/Triton optimized SDPA 
         attn_output = F.scaled_dot_product_attention(q_full, k_full, v, is_causal=True)

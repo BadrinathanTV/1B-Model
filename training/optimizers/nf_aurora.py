@@ -1,22 +1,21 @@
-"""
-NF-Aurora: Schedule-Free Leverage-Aware Spectral Optimizer
-==========================================================
-
-Combines Schedule-Free dynamics with Aurora's leverage-uniform polar factor.
-"""
-
 import math
 import torch
+import torch.distributed as dist
+from .polar import polar_fast
 
-from .polar import polar_pe8 as _polar_ns
+
+@torch.compile
+def _compute_ip_term(grad, z, x, sf_beta1_k):
+    """Fuses inner product subtraction and reduction to eliminate allocations."""
+    return sf_beta1_k * torch.sum(grad * (z - x))
 
 
-@torch.no_grad()
-def _aurora_polar(update, pp_iterations=2, pp_beta=0.5, eps=1e-7):
-    """Compute leverage-uniform polar factor (Aurora's core innovation)."""
+@torch.compile
+def _aurora_polar_compiled(update, pp_iterations=2, pp_beta=0.5, eps=1e-7):
+    """Compute leverage-uniform polar factor (Aurora's core innovation) using fast Newton-Schulz."""
     m, n = update.shape
     if m == n:
-        return _polar_ns(update)
+        return polar_fast(update, eps=eps)
 
     transposed = m < n
     if transposed:
@@ -29,7 +28,7 @@ def _aurora_polar(update, pp_iterations=2, pp_beta=0.5, eps=1e-7):
     D = 1.0 / row_norm
 
     for k in range(pp_iterations):
-        U = _polar_ns(D * G32)
+        U = polar_fast(D * G32, eps=eps)
         if k < pp_iterations - 1:
             row_sq = U.to(torch.float32).pow(2).sum(dim=-1, keepdim=True).clamp_(min=eps * eps)
             D = D * (target_row_sq / row_sq).pow(pp_beta)
@@ -37,167 +36,241 @@ def _aurora_polar(update, pp_iterations=2, pp_beta=0.5, eps=1e-7):
     return U.mT if transposed else U
 
 
-class NFAurora(torch.optim.Optimizer):
-    """Schedule-Free Aurora: horizon-free leverage-aware spectral optimizer.
+_aurora_polar = _aurora_polar_compiled
 
-    Designed for 2D matrix weights in transformers. For 1D parameters,
-    falls back to an internal Schedule-Free AdamW.
+
+@torch.compile
+def _update_1d_param(z, y, grad, exp_avg, exp_avg_sq, beta1, beta2, bias_correction1, bias_correction2, group_lr, decay, eps):
+    """Fuses the entire AdamC 1D update into a single kernel with zero allocations."""
+    if decay > 0:
+        z.add_(y, alpha=-decay * group_lr * group_lr)
+    
+    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+    
+    denom = (exp_avg_sq / bias_correction2).sqrt_().add_(eps)
+    step = (exp_avg / bias_correction1) * group_lr / denom
+    z.sub_(step)
+
+
+class NFAurora(torch.optim.Optimizer):
+    """
+    NFAurora: Schedule-Free Leverage-Aware Spectral Optimizer
+    ==========================================================
+    
+    Combines:
+    1. Aurora leverage-uniform orthogonalization for 2D matrix parameters.
+    2. AdamC Polyak for 1D non-matrix parameters (Inverse-L1 gradient norm scaling).
+    3. ScheduleFree+ dynamics (Beta annealing, r=1 weighting, c_warmup).
+    
+    Based on "Aurora: Leverage-Aware Spectral Optimization"
+    and "ScheduleFree+: Scaling Learning-Rate-Free & Schedule-Free Learning".
     """
 
-    def __init__(self, params, lr=0.01, beta=0.9, momentum=0.95,
-                 weight_decay=0.05, warmup_steps=2000, eta_scale=0.2,
-                 pp_iterations=2, pp_beta=0.5, nesterov=True, eps=1e-7):
-        defaults = dict(
-            lr=lr, beta=beta, momentum=momentum, weight_decay=weight_decay,
-            warmup_steps=warmup_steps, eta_scale=eta_scale,
-            pp_iterations=pp_iterations, pp_beta=pp_beta,
-            nesterov=nesterov, eps=eps,
-            k=0, train_mode=True, weight_sum=0.0,
-        )
+    def __init__(self, params, lr=1.0, betas=(0.9, 0.95), sf_beta1=0.9, eps=1e-8,
+                 weight_decay=0.0, r=1.0, polyak_beta=0.0, c_warmup=0,
+                 sf_beta1_anneal_steps=0, sf_beta1_max=0.965, weight_lr_power=2.0,
+                 eta_scale=0.2, pp_iterations=2, pp_beta=0.5):
+        defaults = dict(lr=lr, betas=betas, sf_beta1=sf_beta1, eps=eps, r=r,
+                        k=0, train_mode=True, weight_sum=0.0, lr_max=eps,
+                        scheduled_lr=0.0, polyak_beta=polyak_beta,
+                        sf_beta1_anneal_steps=sf_beta1_anneal_steps,
+                        sf_beta1_max=sf_beta1_max, grad_l1_ema=0.0,
+                        c_warmup=c_warmup, weight_lr_power=weight_lr_power,
+                        weight_decay=weight_decay, eta_scale=eta_scale,
+                        pp_iterations=pp_iterations, pp_beta=pp_beta)
         super().__init__(params, defaults)
 
     @torch.no_grad()
     def eval(self):
-        """Switch to evaluation mode: set live weights to X_t (averaged)."""
         for group in self.param_groups:
-            if group["train_mode"]:
-                beta = group["beta"]
-                for p in group["params"]:
+            if group['train_mode']:
+                for p in group['params']:
                     state = self.state[p]
-                    if "z" in state:
-                        p.lerp_(end=state["z"], weight=1.0 - 1.0 / beta)
-                group["train_mode"] = False
+                    if 'x' in state:
+                        p.detach().copy_(state['x'])
+                group['train_mode'] = False
 
     @torch.no_grad()
     def train(self):
-        """Switch to training mode: restore live weights to Y_t."""
         for group in self.param_groups:
-            if not group["train_mode"]:
-                beta = group["beta"]
-                for p in group["params"]:
+            if not group['train_mode']:
+                for p in group['params']:
                     state = self.state[p]
-                    if "z" in state:
-                        p.lerp_(end=state["z"], weight=1.0 - beta)
-                group["train_mode"] = True
+                    if 'y' in state:
+                        p.detach().copy_(state['y'])
+                group['train_mode'] = True
 
     @torch.no_grad()
     def step(self, closure=None):
-        loss = closure() if closure else None
+        if not self.param_groups[0]['train_mode']:
+            raise Exception("Optimizer must be in train mode.")
+        
+        device = self.param_groups[0]['params'][0].device
+        function_value = None
+        if closure is not None:
+            function_value = closure()
+        if function_value is None:
+            function_value = torch.tensor(0.0, device=device)
+        elif not isinstance(function_value, torch.Tensor):
+            function_value = torch.tensor(float(function_value), device=device)
+            
+        group0 = self.param_groups[0]
+        grad_l1_ema = group0['grad_l1_ema']
+        k = group0['k']
+        polyak_beta = group0['polyak_beta']
+        sf_beta1 = group0['sf_beta1']
+        sf_beta1_max = group0['sf_beta1_max']
+        sf_beta1_anneal_steps = group0['sf_beta1_anneal_steps']
+        
+        if sf_beta1_anneal_steps > 0:
+            progress = min(k / sf_beta1_anneal_steps, 1.0)
+            sf_beta1_k = 1 - math.exp(math.log(1 - sf_beta1) * (1 - progress) + math.log(1 - sf_beta1_max) * progress)
+        else:
+            sf_beta1_k = sf_beta1
 
+        grad_l1_list = []
+        ip_term_list = []
+        is_distributed = False
+        
         for group in self.param_groups:
-            beta = group["beta"]
-            mu = group["momentum"]
-            eta_scale = group["eta_scale"]
-            decay = group["weight_decay"]
-            nesterov = group["nesterov"]
-            pp_iters = group["pp_iterations"]
-            pp_b = group["pp_beta"]
-            eps = group["eps"]
-            k = group["k"]
-            warmup = group["warmup_steps"]
-
-            sched = min(1.0, (k + 1) / warmup) if warmup > 0 else 1.0
-            lr = group["lr"] * sched
-            weight = lr * lr
-            weight_sum = group["weight_sum"] = group["weight_sum"] + weight
-            ckp1 = weight / weight_sum
-
-            use_aurora = group.get("use_aurora", True)
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-
+            for p in group['params']:
+                if p.grad is None: continue
+                grad = p.grad.data
+                
+                if hasattr(grad, 'to_local'):
+                    is_distributed = True
+                    local_grad = grad.to_local()
+                else:
+                    local_grad = grad
+                    
+                grad_l1_list.append(torch.linalg.vector_norm(local_grad, ord=1))
+                state = self.state[p]
+                if 'z' in state:
+                    z = state['z']
+                    x = state['x']
+                    local_z = z.to_local() if hasattr(z, 'to_local') else z
+                    local_x = x.to_local() if hasattr(x, 'to_local') else x
+                    ip_term_list.append(_compute_ip_term(local_grad, local_z, local_x, sf_beta1_k))
+                    
+        grad_l1 = torch.stack(grad_l1_list).sum() if grad_l1_list else torch.tensor(0.0, device=device)
+        ip_term = torch.stack(ip_term_list).sum() if ip_term_list else torch.tensor(0.0, device=device)
+        
+        if is_distributed and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(grad_l1, op=dist.ReduceOp.SUM)
+            dist.all_reduce(ip_term, op=dist.ReduceOp.SUM)
+            dist_tensor = torch.zeros(1, device=device)
+            dist_tensor[0] = function_value
+            dist.all_reduce(dist_tensor, op=dist.ReduceOp.AVG)
+            global_function_value = dist_tensor[0]
+        else:
+            global_function_value = function_value
+            
+        if not isinstance(group0['grad_l1_ema'], torch.Tensor):
+            group0['grad_l1_ema'] = torch.tensor(group0['grad_l1_ema'], device=device)
+        grad_l1_ema = group0['grad_l1_ema']
+        
+        grad_l1_ema.mul_(polyak_beta).add_(grad_l1, alpha=(1 - polyak_beta) * math.sqrt(math.pi / 2))
+        
+        if polyak_beta > 0:
+            grad_l1_ema_corr = grad_l1_ema / (1 - polyak_beta ** (k + 1))
+        else:
+            grad_l1_ema_corr = grad_l1 * math.sqrt(math.pi / 2)
+        
+        polyak_lr = torch.where(
+            grad_l1_ema_corr == 0,
+            torch.ones_like(grad_l1_ema_corr),
+            torch.clamp(global_function_value + ip_term, min=0.0) / grad_l1_ema_corr
+        )
+            
+        for group in self.param_groups:
+            eps = group['eps']
+            lr = max(group['lr'], eps)
+            decay = group['weight_decay']
+            beta1, beta2 = group['betas']
+            k = group['k']
+            r = group['r']
+            weight_lr_power = group['weight_lr_power']
+            c_warmup = group['c_warmup']
+            eta_scale = group['eta_scale']
+            pp_iterations = group['pp_iterations']
+            pp_beta = group['pp_beta']
+            
+            group_lr = lr * polyak_lr
+            group['grad_l1_ema'] = grad_l1_ema
+            group['scheduled_lr'] = group_lr
+            
+            if not isinstance(group['lr_max'], torch.Tensor):
+                group['lr_max'] = torch.tensor(group['lr_max'], device=device)
+            lr_max = group['lr_max'] = torch.maximum(group_lr, group['lr_max'])
+            
+            if k < c_warmup:
+                ckp1 = 1.0
+            else:
+                weight = ((k + 1) ** r) * (lr_max ** weight_lr_power)
+                if not isinstance(group['weight_sum'], torch.Tensor):
+                    group['weight_sum'] = torch.tensor(group['weight_sum'], device=device)
+                group['weight_sum'] = group['weight_sum'] + weight
+                ckp1 = weight / group['weight_sum']
+                
+            for p in group['params']:
+                if p.grad is None: continue
                 grad = p.grad
                 state = self.state[p]
-
-                if "z" not in state:
-                    state["z"] = p.clone()
-                    state["mom"] = torch.zeros_like(p)
-
-                if p.ndim == 2 and use_aurora:
-                    if "z" not in state:
-                        state["z"] = p.clone()
-                        state["mom"] = torch.zeros_like(p)
-                    z = state["z"]
-                    mom = state["mom"]
-                    self._step_2d(p, grad, z, mom, mu, nesterov, pp_iters,
-                                  pp_b, eps, eta_scale, lr, beta, decay, ckp1)
+                
+                if 'z' not in state:
+                    state['z'] = torch.clone(p.detach(), memory_format=torch.preserve_format)
+                    state['x'] = torch.clone(p.detach(), memory_format=torch.preserve_format)
+                    state['y'] = torch.clone(p.detach(), memory_format=torch.preserve_format)
+                    
+                    if p.ndim == 2 and group.get('use_aurora', True):
+                        state['mom'] = torch.zeros_like(p.detach(), memory_format=torch.preserve_format)
+                    else:
+                        state['exp_avg'] = torch.zeros_like(p.data, memory_format=torch.preserve_format)
+                        state['exp_avg_sq'] = torch.zeros_like(p.data, memory_format=torch.preserve_format)
+                        
+                z, x, y = state['z'], state['x'], state['y']
+                
+                if p.ndim == 2 and group.get('use_aurora', True):
+                    mom = state['mom']
+                    
+                    # Weight decay applied directly on Z at point y via fused add_
+                    if decay > 0:
+                        z.add_(y, alpha=-decay * group_lr * group_lr)
+                    
+                    # Explicit momentum
+                    mom.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    
+                    # Aurora Leverage-Uniform Polar factor via compiled helper
+                    Pt = _aurora_polar_compiled(mom, pp_iterations=pp_iterations, pp_beta=pp_beta, eps=eps)
+                    Pt_norm = Pt.norm().clamp(min=1e-12)
+                    
+                    # Global scaling to match Adam RMS scale
+                    m, n = p.shape
+                    step_size = group_lr * (-eta_scale * math.sqrt(m * n))
+                    step_size_scaled = step_size / Pt_norm
+                    
+                    # Update z with zero extra matrix allocations
+                    z.add_(Pt, alpha=step_size_scaled)
                 else:
-                    if "z" not in state:
-                        state["z"] = p.clone()
-                    z = state["z"]
-                    self._step_1d(p, grad, z, state, lr, beta, decay, ckp1)
-
-            group["k"] = k + 1
-        return loss
-
-    def _step_2d(self, p, grad, z, mom, mu, nesterov, pp_iters,
-                 pp_b, eps, eta_scale, lr, beta, decay, ckp1):
-        """2D matrix: Aurora + Schedule-Free."""
-        mom.lerp_(grad, 1.0 - mu)
-        update = grad.lerp(mom, mu) if nesterov else mom.clone()
-
-        P = _aurora_polar(update, pp_iterations=pp_iters,
-                          pp_beta=pp_b, eps=eps).to(p.dtype)
-
-        m, n = p.shape
-        P_norm = P.float().norm().item()
-        eta_hat = eta_scale * lr * math.sqrt(m * n) / max(1e-12, P_norm)
-
-        x_t = (p.data - (1.0 - beta) * z) / beta
-        if decay != 0.0:
-            z.sub_(z, alpha=lr * decay)
-        z.sub_(P, alpha=eta_hat)
-        x_tp1 = (1.0 - ckp1) * x_t + ckp1 * z
-        p.data.copy_((1.0 - beta) * z + beta * x_tp1)
-
-    def _step_1d(self, p, grad, z, state, lr, beta, decay, ckp1):
-        """1D parameters: 4-bit quantized Schedule-Free AdamW fallback."""
-        if "q_exp_avg_sq" not in state:
-            state["q_exp_avg_sq"] = torch.zeros_like(p, dtype=torch.uint8)
+                    # AdamC Polyak for 1D (Fully compiled & zero-allocation helper)
+                    exp_avg = state['exp_avg']
+                    exp_avg_sq = state['exp_avg_sq']
+                    
+                    bias_correction1 = 1 - beta1 ** (k + 1)
+                    bias_correction2 = 1 - beta2 ** (k + 1)
+                    
+                    _update_1d_param(
+                        z, y, grad, exp_avg, exp_avg_sq,
+                        beta1, beta2, bias_correction1, bias_correction2,
+                        group_lr, decay, eps
+                    )
+                    
+                # Schedule-Free Extrapolation (Zero allocations)
+                x.mul_(1.0 - ckp1).add_(z, alpha=ckp1)
+                y.copy_(x).mul_(sf_beta1_k).add_(z, alpha=1.0 - sf_beta1_k)
+                p.detach().copy_(y)
+                
+            group['k'] = k + 1
             
-            if p.ndim >= 2:
-                scale_shape = (p.shape[0],) + (1,) * (p.ndim - 1)
-            elif p.ndim == 1:
-                scale_shape = (1,)
-            else:
-                scale_shape = ()
-            state["scale_exp_avg_sq"] = torch.zeros(scale_shape, device=p.device, dtype=torch.float32)
-
-        # Dequantize second moment
-        v = state["q_exp_avg_sq"].to(torch.float32) * state["scale_exp_avg_sq"]
-
-        # SF-AdamW uses raw gradient and no first moment EMA
-        beta2 = 0.99
-        v.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-
-        # Unsigned 4-bit quantization of v to [0, 15]
-        if p.ndim >= 2:
-            max_v = torch.amax(v, dim=-1, keepdim=True)
-        elif p.ndim == 1:
-            max_v = torch.max(v).unsqueeze(0)
-        else:
-            max_v = v.clone()
-        scale_v = (max_v / 15.0).clamp_(min=1e-12)
-        q_v = torch.clamp(torch.round(v / scale_v), 0, 15).to(torch.uint8)
-
-        state["q_exp_avg_sq"] = q_v
-        state["scale_exp_avg_sq"] = scale_v
-
-        # Dequantize again for the step update
-        v = q_v.to(torch.float32) * scale_v
-
-        # Safety bound against 4-bit quantization division-by-zero
-        min_v = (1.0 - beta2) * grad.pow(2)
-        v = torch.max(v, min_v)
-
-        # SF-AdamW effective learning rate scaling
-        eta_t = lr * math.sqrt(1.0 - beta2)
-        update_1d = grad / (v.sqrt() + 1e-8)
-
-        x_t = (p.data - (1.0 - beta) * z) / beta
-        if decay != 0.0:
-            z.sub_(z, alpha=eta_t * decay)
-        z.sub_(update_1d, alpha=eta_t)
-        x_tp1 = (1.0 - ckp1) * x_t + ckp1 * z
-        p.data.copy_((1.0 - beta) * z + beta * x_tp1)
+        return function_value
