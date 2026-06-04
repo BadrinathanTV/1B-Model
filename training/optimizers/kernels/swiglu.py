@@ -14,9 +14,13 @@ try:
     TRITON_AVAILABLE = True
 except ImportError:
     TRITON_AVAILABLE = False
+    triton = None
+    tl = None
 
 
 if TRITON_AVAILABLE:
+    assert triton is not None
+    assert tl is not None
     @triton.jit
     def _swiglu_fwd_kernel(
         gate_ptr, up_ptr, out_ptr,
@@ -37,6 +41,8 @@ if TRITON_AVAILABLE:
         out = silu_gate * up
         
         tl.store(out_ptr + offsets, out.to(tl.bfloat16), mask=mask)
+else:
+    _swiglu_fwd_kernel = None
 
 
 def swiglu_forward(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
@@ -54,6 +60,8 @@ def swiglu_forward(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         import torch.nn.functional as F
         return F.silu(gate) * up
     
+    assert triton is not None
+    assert _swiglu_fwd_kernel is not None
     assert gate.shape == up.shape
     out = torch.empty_like(gate)
     n_elements = gate.numel()
@@ -64,7 +72,7 @@ def swiglu_forward(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     _swiglu_fwd_kernel[grid](
         gate.view(-1), up.view(-1), out.view(-1),
         n_elements,
-        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_SIZE=BLOCK_SIZE,  # type: ignore
     )
     
     return out

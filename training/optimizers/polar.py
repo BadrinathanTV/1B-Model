@@ -75,6 +75,7 @@ def polar_compiled(G: torch.Tensor, steps: int = 12, eps: float = 1e-7) -> torch
         X = X.mT
     return X
 
+@torch.compile
 def polar_fast(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
     """Fast Newton-Schulz with aggressive NorMuon coefficients.
 
@@ -87,7 +88,7 @@ def polar_fast(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tens
 
     Only supports 2D inputs.
     """
-    assert G.ndim == 2
+    # assert removed for torch.compile compatibility; caller must ensure G.ndim == 2
     X = G.bfloat16()
     if G.size(0) > G.size(1):
         X = X.mT

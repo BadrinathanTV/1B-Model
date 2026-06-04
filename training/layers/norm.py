@@ -14,7 +14,7 @@ except ImportError:
 
     class RMSNorm(nn.Module):
         """Root Mean Square Layer Normalization (PyTorch fallback)."""
-        def __init__(self, dim: int, eps: float = 1e-6):
+        def __init__(self, dim: int, eps: float = 1e-6, use_triton: bool = True):
             super().__init__()
             self.eps = eps
             self.weight = nn.Parameter(torch.ones(dim))

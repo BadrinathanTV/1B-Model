@@ -7,6 +7,7 @@ falls back to PyTorch complex arithmetic otherwise.
 """
 
 import torch
+import math
 
 try:
     from liger_kernel.ops.rope import LigerRopeFunction
@@ -71,14 +72,6 @@ def precompute_cos_sin(dim: int, end: int, theta: float = 10000.0, device: torch
     return (angles.cos() * mscale).to(dtype), (angles.sin() * mscale).to(dtype)
 
 
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """Reshape freqs_cis to be broadcastable with x."""
-    ndim = x.ndim
-    assert ndim >= 2, "Tensor must have at least 2 dimensions"
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
-
-
 def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor,
                      cos_cache: torch.Tensor | None = None, sin_cache: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary position embeddings to query and key tensors.
@@ -94,11 +87,16 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
         xq_liger = xq.transpose(1, 2)
         xk_liger = xk.transpose(1, 2)
         
-        # Liger expects cos/sin to be [1, seq_len, head_dim] or [1, seq_len, head_dim//2]
-        cos_s = cos_cache[:seq_len].unsqueeze(0)
-        sin_s = sin_cache[:seq_len].unsqueeze(0)
+        # FIX 1: Duplicate cos/sin to match the full head_dim for the Triton kernel
+        cos_full_liger = torch.cat([cos_cache[:seq_len], cos_cache[:seq_len]], dim=-1)
+        sin_full_liger = torch.cat([sin_cache[:seq_len], sin_cache[:seq_len]], dim=-1)
         
-        xq_out, xk_out = LigerRopeFunction.apply(xq_liger, xk_liger, cos_s, sin_s, None, 0)
+        # FIX 2: Cast to xq's dtype to prevent silent Triton C++ compilation crashes
+        cos_s = cos_full_liger.unsqueeze(0).to(xq.dtype)
+        sin_s = sin_full_liger.unsqueeze(0).to(xq.dtype)
+        
+        # FIX 3: Use unsqueeze_dim=1 (Liger standard) to properly broadcast over num_heads
+        xq_out, xk_out = LigerRopeFunction.apply(xq_liger, xk_liger, cos_s, sin_s, None, 1)
         
         # Transpose back to [batch, seq_len, num_heads, head_dim]
         return xq_out.transpose(1, 2), xk_out.transpose(1, 2)

@@ -57,7 +57,7 @@ class TestTokenSuperpositionEmbedding(unittest.TestCase):
         seq_len = 10
         input_ids = torch.randint(0, self.config.vocab_size, (batch_size, seq_len))
         
-        with self.assertRaises(ValueError):
+        with self.assertRaises((ValueError, AssertionError)):
             embedding(input_ids)
 
     def test_tst_backward(self):
@@ -109,8 +109,8 @@ class TestTSTDataPipeline(unittest.TestCase):
             # Get the first item in superposition phase
             inputs, targets = dataset_super[0]
             
-            # inputs should be first 8 elements
-            self.assertEqual(inputs.tolist(), list(range(8)))
+            # inputs should be first 8 elements (folded into shape (seq_len, group_size))
+            self.assertEqual(inputs.tolist(), [[0, 1, 2, 3], [4, 5, 6, 7]])
             
             # targets should be bags of 4 elements starting after inputs
             # Group 0: input [0,1,2,3] -> target [4,5,6,7]

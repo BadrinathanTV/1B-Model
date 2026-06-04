@@ -87,5 +87,49 @@ class TestTSTLoss(unittest.TestCase):
         self.assertIsNotNone(hidden_states.grad)
         self.assertFalse(torch.isnan(hidden_states.grad).any())
 
+    def test_mce_loss_superposition_phase_with_mtp(self):
+        batch_size = 2
+        seq_len = 8
+        group_size = 4
+        
+        # In superposition phase with MTP, targets is shape (batch_size, seq_len, group_size)
+        targets = torch.randint(0, self.config.vocab_size, (batch_size, seq_len, group_size))
+        
+        hidden_states_main = torch.randn(batch_size, seq_len, self.config.hidden_size, requires_grad=True)
+        hidden_states_mtp = torch.randn(batch_size, seq_len, self.config.hidden_size, requires_grad=True)
+        hidden_states_list = [hidden_states_main, hidden_states_mtp]
+
+        # Calculate loss (is_superposition = True)
+        loss, metrics = compute_loss(
+            hidden_states_list, targets, self.lm_head_weight, self.config, step=10, is_superposition=True
+        )
+        
+        # Verify shape & properties
+        self.assertEqual(loss.ndim, 0)
+        self.assertTrue(loss > 0)
+        self.assertIn("main_loss", metrics)
+        self.assertIn("mtp_loss", metrics)
+        self.assertTrue(metrics["mtp_loss"] > 0)
+
+        # Manually compute MTP MCE to verify it matches
+        # For MTP-1 (i=1), targets are targets[:, 1:, :] and mtp_h is hidden_states_mtp[:, :-1, :]
+        mtp_h = hidden_states_mtp[:, :-1, :]
+        mtp_targets = targets[:, 1:, :]
+        manual_mtp_mce = 0.0
+        for j in range(group_size):
+            t_j = mtp_targets[:, :, j].contiguous()
+            logits = F.linear(mtp_h, self.lm_head_weight)
+            manual_mtp_mce += F.cross_entropy(logits.view(-1, self.config.vocab_size), t_j.view(-1))
+        expected_mtp_loss = manual_mtp_mce / group_size
+
+        self.assertAlmostEqual(metrics["mtp_loss"].item(), expected_mtp_loss.item(), places=5)
+
+        # Backward pass check
+        loss.backward()
+        self.assertIsNotNone(hidden_states_main.grad)
+        self.assertIsNotNone(hidden_states_mtp.grad)
+        self.assertFalse(torch.isnan(hidden_states_main.grad).any())
+        self.assertFalse(torch.isnan(hidden_states_mtp.grad).any())
+
 if __name__ == '__main__':
     unittest.main()

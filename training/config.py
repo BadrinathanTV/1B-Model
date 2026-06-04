@@ -12,8 +12,7 @@ Supports:
 
 from __future__ import annotations
 
-import copy
-import os
+
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
@@ -173,9 +172,9 @@ class SLMConfig:
         if self.max_delta_history < 0:
             raise ValueError(f"max_delta_history must be >= 0, got {self.max_delta_history}")
 
-        if self.optimizer.type not in ("hybrid", "nf_aurora", "sf_normuon", "adamw"):
+        if self.optimizer.type not in ("hybrid", "nf_aurora", "sf_normuon", "adamw", "nf_aurora_hybrid", "nf_normuon_hybrid"):
             raise ValueError(
-                f"optimizer.type must be 'hybrid', 'nf_aurora', 'sf_normuon', or 'adamw', "
+                f"optimizer.type must be 'hybrid', 'nf_aurora', 'sf_normuon', 'adamw', 'nf_aurora_hybrid', or 'nf_normuon_hybrid', "
                 f"got '{self.optimizer.type}'"
             )
 

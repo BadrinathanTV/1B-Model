@@ -17,9 +17,13 @@ try:
     TRITON_AVAILABLE = True
 except ImportError:
     TRITON_AVAILABLE = False
+    triton = None
+    tl = None
 
 
 if TRITON_AVAILABLE:
+    assert triton is not None
+    assert tl is not None
     @triton.jit
     def _rms_norm_fwd_kernel(
         x_ptr, w_ptr, out_ptr, rrms_ptr,
@@ -86,10 +90,15 @@ if TRITON_AVAILABLE:
         
         # dw = dy * x * rrms (Note: in a real implementation we need to atomically add this across rows)
         # We will compute dw in pure PyTorch for simplicity since atomic adds across many blocks can be slow.
+else:
+    _rms_norm_fwd_kernel = None
+    _rms_norm_bwd_kernel = None
 
 class TritonRMSNormFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, eps):
+        assert triton is not None
+        assert _rms_norm_fwd_kernel is not None
         orig_shape = x.shape
         x_2d = x.contiguous().view(-1, x.shape[-1])
         out = torch.empty_like(x_2d)
@@ -114,7 +123,9 @@ class TritonRMSNormFunction(torch.autograd.Function):
         return out.view(orig_shape)
 
     @staticmethod
-    def backward(ctx, dy):
+    def backward(ctx, dy):  # type: ignore
+        assert triton is not None
+        assert _rms_norm_bwd_kernel is not None
         x_2d, weight, rrms = ctx.saved_tensors
         dy_2d = dy.contiguous().view(-1, x_2d.shape[-1])
         dx_2d = torch.empty_like(x_2d)

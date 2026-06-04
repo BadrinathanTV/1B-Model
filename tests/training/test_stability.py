@@ -12,7 +12,7 @@ from config import SLMConfig
 from layers.attention import MultiHeadLatentAttention
 from layers.rope import precompute_freqs_cis, precompute_cos_sin
 from layers.residual import DeltaAttentionResidual
-from models.mtp import MTPProjection, MTPModule
+from models.mtp import DeepSeekMTPBlock, MTPModule
 
 class TestSLMStabilitySuite(unittest.TestCase):
     def setUp(self):
@@ -107,7 +107,7 @@ class TestSLMStabilitySuite(unittest.TestCase):
         x = torch.randn(self.batch_size, self.seq_len, self.config.hidden_size, device=device)
         
         # Instantiate standard proper MTP head
-        mtp_proper = MTPProjection(self.config).to(device)
+        mtp_proper = DeepSeekMTPBlock(self.config).to(device)
         
         # Instantiate a degraded linear MTP projection head without SwiGLU / RMSNorm/ Residual 
         class DegradedMTPProjection(nn.Module):
@@ -123,8 +123,11 @@ class TestSLMStabilitySuite(unittest.TestCase):
         proper_out = x
         degraded_out = x
         
+        # Create token embeddings for the chain
+        token_emb = torch.randn(self.batch_size, self.seq_len, self.config.hidden_size, device=device)
+        
         for _ in range(8):
-            proper_out = mtp_proper(proper_out)
+            proper_out = mtp_proper(proper_out, token_emb)
             degraded_out = mtp_degraded(degraded_out)
             
         proper_variance = proper_out.var().item()

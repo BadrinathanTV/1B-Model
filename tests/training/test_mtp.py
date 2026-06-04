@@ -7,31 +7,32 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../training")))
 
 from config import SLMConfig
-from models.mtp import MTPProjection, MTPModule
+from models.mtp import DeepSeekMTPBlock, MTPModule
 from model import SLMModel
 from train import compute_loss
 
-class TestMTPProjection(unittest.TestCase):
+class TestDeepSeekMTPBlock(unittest.TestCase):
     def setUp(self):
         self.config = SLMConfig()
         self.config.hidden_size = 64
         self.config.rms_norm_eps = 1e-6
 
-    def test_mtp_projection_shape_and_residual(self):
-        proj = MTPProjection(self.config)
+    def test_mtp_block_shape_and_residual(self):
+        block = DeepSeekMTPBlock(self.config)
         batch_size = 2
         seq_len = 8
         
         # Test input shape matching output shape
-        x = torch.randn(batch_size, seq_len, self.config.hidden_size)
-        y = proj(x)
-        self.assertEqual(x.shape, y.shape)
+        h = torch.randn(batch_size, seq_len, self.config.hidden_size)
+        token_emb = torch.randn(batch_size, seq_len, self.config.hidden_size)
+        y = block(h, token_emb)
+        self.assertEqual(y.shape, h.shape)
         
         # Verify gradients propagate
         y.sum().backward()
-        self.assertIsNotNone(proj.gate_proj.weight.grad)
-        self.assertIsNotNone(proj.up_proj.weight.grad)
-        self.assertIsNotNone(proj.down_proj.weight.grad)
+        self.assertIsNotNone(block.concat_proj.weight.grad)
+        self.assertIsNotNone(block.ffn.gate_up_proj.weight.grad)
+        self.assertIsNotNone(block.ffn.down_proj.weight.grad)
 
 class TestMTPModule(unittest.TestCase):
     def setUp(self):
@@ -46,7 +47,7 @@ class TestMTPModule(unittest.TestCase):
 
     def test_mtp_enabled(self):
         mtp = MTPModule(self.config, self.lm_head)
-        self.assertEqual(len(mtp.projs), 2)
+        self.assertEqual(len(mtp.blocks), 2)
         
         batch_size = 2
         seq_len = 8
@@ -139,6 +140,41 @@ class TestMTPIntegration(unittest.TestCase):
         self.assertEqual(len(hidden_states_nomtp), 1)
         loss_nomtp, _ = compute_loss(hidden_states_nomtp, targets, model.lm_head.weight, config, 0)
         loss_nomtp.backward()
+        self.assertIsNotNone(model.embed.word_embeddings.weight.grad)
+
+    def test_full_model_mtp_and_tst_superposition(self):
+        from layers.rope import precompute_freqs_cis, precompute_cos_sin
+        
+        config = SLMConfig()
+        config.vocab_size = 100
+        config.hidden_size = 64
+        config.num_hidden_layers = 2
+        config.num_attention_heads = 2
+        config.tst_group_size = 2 # Enable TST
+        config.mtp_depth = 3
+        config.training.seq_len = 8
+        config.max_delta_history = 0
+        
+        model = SLMModel(config)
+        model.train()
+        
+        batch_size = 2
+        # TST inputs/targets are (batch_size, seq_len, tst_group_size)
+        inputs = torch.randint(0, config.vocab_size, (batch_size, config.training.seq_len, config.tst_group_size))
+        targets = torch.randint(0, config.vocab_size, (batch_size, config.training.seq_len, config.tst_group_size))
+        
+        freqs_cis = precompute_freqs_cis(config.qk_rope_head_dim, config.training.seq_len, config.rope_theta, inputs.device)
+        cos_cache, sin_cache = precompute_cos_sin(config.qk_rope_head_dim, config.training.seq_len, config.rope_theta, inputs.device)
+        
+        # MTP and TST enabled end-to-end
+        hidden_states_list = model(
+            inputs, freqs_cis=freqs_cis, cos_cache=cos_cache, sin_cache=sin_cache,
+            use_mtp=True, return_hidden_states=True, target_ids=targets
+        )
+        self.assertEqual(len(hidden_states_list), 3)
+        
+        loss, _ = compute_loss(hidden_states_list, targets, model.lm_head.weight, config, 0, is_superposition=True)
+        loss.backward()
         self.assertIsNotNone(model.embed.word_embeddings.weight.grad)
 
 if __name__ == '__main__':

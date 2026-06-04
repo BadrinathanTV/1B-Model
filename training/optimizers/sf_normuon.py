@@ -23,7 +23,7 @@ def _update_vt_and_get_denom(Pt, vt, beta2, eps):
 def _update_1d_param(z, y, grad, exp_avg, exp_avg_sq, beta1, beta2, bias_correction1, bias_correction2, group_lr, decay, eps):
     """Fuses the entire AdamC 1D update into a single kernel with zero allocations."""
     if decay > 0:
-        z.add_(y, alpha=-decay * group_lr * group_lr)
+        z.mul_(1.0 - decay * group_lr)
     
     exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
     exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
@@ -50,14 +50,15 @@ class SFNorMuon(torch.optim.Optimizer):
     def __init__(self, params, lr=1.0, betas=(0.9, 0.95), sf_beta1=0.9, eps=1e-8,
                  weight_decay=0.0, r=1.0, polyak_beta=0.0, c_warmup=0,
                  sf_beta1_anneal_steps=0, sf_beta1_max=0.965, weight_lr_power=2.0,
-                 eta_scale=0.2):
+                 eta_scale=0.2, use_spectral_2d=True):
         defaults = dict(lr=lr, betas=betas, sf_beta1=sf_beta1, eps=eps, r=r,
                         k=0, train_mode=True, weight_sum=0.0, lr_max=eps,
                         scheduled_lr=0.0, polyak_beta=polyak_beta,
                         sf_beta1_anneal_steps=sf_beta1_anneal_steps,
                         sf_beta1_max=sf_beta1_max, grad_l1_ema=0.0,
                         c_warmup=c_warmup, weight_lr_power=weight_lr_power,
-                        weight_decay=weight_decay, eta_scale=eta_scale)
+                        weight_decay=weight_decay, eta_scale=eta_scale,
+                        use_spectral_2d=use_spectral_2d)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -86,12 +87,10 @@ class SFNorMuon(torch.optim.Optimizer):
             raise Exception("Optimizer must be in train mode.")
         
         device = self.param_groups[0]['params'][0].device
-        function_value = None
-        if closure is not None:
-            function_value = closure()
-        if function_value is None:
-            function_value = torch.tensor(0.0, device=device)
-        elif not isinstance(function_value, torch.Tensor):
+        if closure is None:
+            raise RuntimeError("SFNorMuon requires a closure that returns the loss value to compute Polyak step sizes.")
+        function_value = closure()
+        if not isinstance(function_value, torch.Tensor):
             function_value = torch.tensor(float(function_value), device=device)
             
         group0 = self.param_groups[0]
@@ -108,9 +107,9 @@ class SFNorMuon(torch.optim.Optimizer):
         else:
             sf_beta1_k = sf_beta1
 
-        grad_l1_list = []
-        ip_term_list = []
-        is_distributed = False
+        grad_l1 = torch.tensor(0.0, device=device)
+        ip_term = torch.tensor(0.0, device=device)
+        is_distributed = dist.is_available() and dist.is_initialized()
         
         for group in self.param_groups:
             for p in group['params']:
@@ -118,24 +117,20 @@ class SFNorMuon(torch.optim.Optimizer):
                 grad = p.grad.data
                 
                 if hasattr(grad, 'to_local'):
-                    is_distributed = True
                     local_grad = grad.to_local()
                 else:
                     local_grad = grad
                     
-                grad_l1_list.append(torch.linalg.vector_norm(local_grad, ord=1))
+                grad_l1 += torch.linalg.vector_norm(local_grad, ord=1)
                 state = self.state[p]
                 if 'z' in state:
                     z = state['z']
                     x = state['x']
                     local_z = z.to_local() if hasattr(z, 'to_local') else z
                     local_x = x.to_local() if hasattr(x, 'to_local') else x
-                    ip_term_list.append(_compute_ip_term(local_grad, local_z, local_x, sf_beta1_k))
-                    
-        grad_l1 = torch.stack(grad_l1_list).sum() if grad_l1_list else torch.tensor(0.0, device=device)
-        ip_term = torch.stack(ip_term_list).sum() if ip_term_list else torch.tensor(0.0, device=device)
+                    ip_term += _compute_ip_term(local_grad, local_z, local_x, sf_beta1_k)
         
-        if is_distributed and dist.is_available() and dist.is_initialized():
+        if is_distributed:
             dist.all_reduce(grad_l1, op=dist.ReduceOp.SUM)
             dist.all_reduce(ip_term, op=dist.ReduceOp.SUM)
             dist_tensor = torch.zeros(1, device=device)
@@ -160,8 +155,9 @@ class SFNorMuon(torch.optim.Optimizer):
         polyak_lr = torch.where(
             grad_l1_ema_corr == 0,
             torch.ones_like(grad_l1_ema_corr),
-            torch.clamp(global_function_value + ip_term, min=0.0) / grad_l1_ema_corr
+            torch.clamp(global_function_value + ip_term, min=0.0) / (grad_l1_ema_corr + 1e-8)
         )
+        polyak_lr = torch.clamp(polyak_lr, max=10.0)
             
         for group in self.param_groups:
             eps = group['eps']
@@ -201,7 +197,7 @@ class SFNorMuon(torch.optim.Optimizer):
                     state['x'] = torch.clone(p.detach(), memory_format=torch.preserve_format)
                     state['y'] = torch.clone(p.detach(), memory_format=torch.preserve_format)
                     
-                    if p.ndim == 2 and group.get('use_aurora', True):
+                    if p.ndim == 2 and group.get('use_spectral_2d', True):
                         state['mom'] = torch.zeros_like(p.detach(), memory_format=torch.preserve_format)
                         state['vt'] = torch.zeros(p.size(0), 1, device=p.device, dtype=p.dtype)
                     else:
@@ -210,14 +206,14 @@ class SFNorMuon(torch.optim.Optimizer):
                         
                 z, x, y = state['z'], state['x'], state['y']
                 
-                if p.ndim == 2 and group.get('use_aurora', True):
+                if p.ndim == 2 and group.get('use_spectral_2d', True):
                     # SF-NorMuon Algorithm 1
                     mom = state['mom']
                     vt = state['vt']
                     
-                    # Weight decay applied directly on Z at point y via fused add_
+                    # Weight decay applied directly on Z via mul_ to avoid alpha=tensor issues
                     if decay > 0:
-                        z.add_(y, alpha=-decay * group_lr * group_lr)
+                        z.mul_(1.0 - decay * group_lr)
                     
                     # Explicit momentum before polar
                     mom.mul_(beta1).add_(grad, alpha=1 - beta1)
@@ -232,13 +228,14 @@ class SFNorMuon(torch.optim.Optimizer):
                     Pt.div_(P_hat_denom)
                     Pt_norm = Pt.norm().clamp(min=1e-12)
                     
-                    # Global scaling to match Adam RMS scale
+                    # Global scaling to match Aurora / SF-NorMuon scaling
                     m, n = p.shape
-                    step_size = group_lr * (-eta_scale * math.sqrt(m * n))
+                    step_size = group_lr * (-eta_scale / math.sqrt(max(m, n)))
                     step_size_scaled = step_size / Pt_norm
                     
                     # Update z with zero extra matrix allocations
-                    z.add_(Pt, alpha=step_size_scaled)
+                    Pt.mul_(step_size_scaled)
+                    z.add_(Pt)
                 else:
                     # AdamC Polyak for 1D (Fully compiled & zero-allocation helper)
                     exp_avg = state['exp_avg']
@@ -254,8 +251,8 @@ class SFNorMuon(torch.optim.Optimizer):
                     )
                     
                 # Schedule-Free Extrapolation (Zero allocations)
-                x.mul_(1.0 - ckp1).add_(z, alpha=ckp1)
-                y.copy_(x).mul_(sf_beta1_k).add_(z, alpha=1.0 - sf_beta1_k)
+                x.lerp_(z, weight=ckp1)
+                y.copy_(x).lerp_(z, weight=1.0 - sf_beta1_k)
                 p.detach().copy_(y)
                 
             group['k'] = k + 1

@@ -10,7 +10,6 @@ TransformerBlock and SLMModel with:
 """
 
 import math
-from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -36,6 +35,10 @@ class TransformerBlock(nn.Module):
         self.layer_idx = layer_idx
         self.config = config
         self.max_delta_history = config.max_delta_history
+        # Resolve max_delta_history=0 ("full history") to a concrete buffer size.
+        # Each layer produces 2 deltas (attn + ffn), so the physical max is 2*num_layers.
+        if self.max_delta_history == 0:
+            self.max_delta_history = 2 * config.num_hidden_layers
 
         # Pre-norms (standard)
         self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -55,26 +58,24 @@ class TransformerBlock(nn.Module):
         self.routing_q_attn = nn.Parameter(torch.zeros(config.hidden_size))
         self.routing_q_ffn = nn.Parameter(torch.zeros(config.hidden_size))
 
-    def _deltas_list(self, deltas_buf, num_deltas):
-        """Convert fixed-size buffer back to list for delta_residual."""
-        if num_deltas == 0:
-            return []
-        return [deltas_buf[i] for i in range(num_deltas)]
-
     def _push_delta(self, deltas_buf, num_deltas, new_delta):
-        """Push a new delta into the fixed-size ring buffer."""
-        if num_deltas < self.max_delta_history:
-            deltas_buf[num_deltas] = new_delta
-            return deltas_buf, num_deltas + 1
-        else:
-            # Shift left and insert at end (FIFO)
-            deltas_buf = torch.cat([deltas_buf[1:], new_delta.unsqueeze(0)], dim=0)
-            return deltas_buf, num_deltas
+        """Push a new delta into the fixed-size ring buffer (branchless).
+
+        Uses torch.where with a positional mask so that num_deltas never
+        appears in a Python branch — the compiled graph is shape-static.
+        """
+        # Write position wraps around the buffer size
+        write_idx = num_deltas % self.max_delta_history
+        # Create a one-hot mask for the write position: (max_hist,) → (max_hist, 1, 1, 1)
+        write_mask = (torch.arange(self.max_delta_history, device=deltas_buf.device) == write_idx)
+        write_mask = write_mask.view(-1, 1, 1, 1)
+        # Overwrite only the target slot, leave all others untouched
+        deltas_buf = torch.where(write_mask, new_delta.unsqueeze(0), deltas_buf)
+        return deltas_buf, num_deltas + 1
 
     def forward(self, x, deltas_buf, num_deltas, freqs_cis=None, cos_cache=None, sin_cache=None):
         # 1. Delta routing enriches x with past deltas for attention input
-        deltas_list = self._deltas_list(deltas_buf, num_deltas)
-        h_attn = self.delta_residual(x, deltas_list, self.routing_q_attn)
+        h_attn = self.delta_residual.forward_static(x, deltas_buf, num_deltas, self.routing_q_attn)
         # 2. Attention computation with post-norm
         v_attn = self.post_attn_norm(
             self.attn(self.attn_norm(h_attn), freqs_cis=freqs_cis,
@@ -85,8 +86,7 @@ class TransformerBlock(nn.Module):
         deltas_buf, num_deltas = self._push_delta(deltas_buf, num_deltas, v_attn)
 
         # 4. Delta routing enriches x with past deltas for FFN input
-        deltas_list = self._deltas_list(deltas_buf, num_deltas)
-        h_ffn = self.delta_residual(x, deltas_list, self.routing_q_ffn)
+        h_ffn = self.delta_residual.forward_static(x, deltas_buf, num_deltas, self.routing_q_ffn)
         # 5. FFN computation with post-norm
         v_ffn = self.post_ffn_norm(self.ffn(self.ffn_norm(h_ffn)))
         # 6. Standard residual: add sublayer output to main stream (NOT h_ffn)
@@ -130,7 +130,7 @@ class SLMModel(nn.Module):
         else:
             self.register_buffer("logit_scale", torch.tensor(base_scale))
 
-        self.mtp = MTPModule(config, self.lm_head)
+        self.mtp = MTPModule(config, self.lm_head, self.embed)
 
         # Apply weight initialization AFTER all modules are created
         self.apply(self._init_weights)
@@ -161,32 +161,34 @@ class SLMModel(nn.Module):
 
     def forward(self, input_ids, freqs_cis=None, cos_cache=None, sin_cache=None,
                 use_mtp: bool = True, return_hidden_states: bool = False,
-                tst_group_size: int = None):
+                tst_group_size: int | None = None, target_ids: torch.Tensor | None = None):
         x = self.embed(input_ids, group_size_override=tst_group_size)
 
         # Pre-allocate fixed-size delta buffer to avoid torch.compile recompilation
         # Shape: (max_delta_history, batch_size, seq_len, hidden_size)
         batch_size, seq_len, hidden_size = x.shape
         max_hist = self.config.max_delta_history
+        if max_hist == 0:
+            max_hist = 2 * self.config.num_hidden_layers
         deltas_buf = torch.zeros(max_hist, batch_size, seq_len, hidden_size,
                                  device=x.device, dtype=x.dtype)
-        num_deltas = 0
+        # num_deltas is a scalar tensor so it flows through checkpoint without
+        # Python int → tensor → int conversions that cause graph breaks.
+        num_deltas = torch.zeros(1, dtype=torch.long, device=x.device)
 
         from torch.utils.checkpoint import checkpoint
         for i, layer in enumerate(self.layers):
             interval = getattr(self.config, "gradient_checkpointing_interval", 1)
             if self.training and self.config.gradient_checkpointing and (i % interval == 0):
                 def custom_forward(x_in, db_in, nd_in):
-                    return layer(x_in, db_in.clone(), int(nd_in.item()),
+                    return layer(x_in, db_in, nd_in,
                                  freqs_cis=freqs_cis,
                                  cos_cache=cos_cache, sin_cache=sin_cache)
-                nd_tensor = torch.tensor(num_deltas, device=x.device)
-                from torch.utils.checkpoint import checkpoint
-                x, deltas_buf, num_deltas = checkpoint(
-                    custom_forward, x, deltas_buf, nd_tensor,
+                out = checkpoint(
+                    custom_forward, x, deltas_buf, num_deltas,
                     use_reentrant=True
-                )  # type: ignore
-                num_deltas = int(num_deltas) if isinstance(num_deltas, torch.Tensor) else num_deltas
+                )
+                x, deltas_buf, num_deltas = out  # type: ignore
             else:
                 x, deltas_buf, num_deltas = layer(
                     x, deltas_buf, num_deltas,
@@ -202,5 +204,5 @@ class SLMModel(nn.Module):
         # Training: return hidden states for fused CE (avoids materializing logits)
         # Inference: return logits directly
         if return_hidden_states:
-            return self.mtp.forward_hidden(x, use_mtp=use_mtp, logit_scale=self.logit_scale)
+            return self.mtp.forward_hidden(x, use_mtp=use_mtp, logit_scale=self.logit_scale, target_ids=target_ids)
         return self.mtp(x, use_mtp=use_mtp, logit_scale=self.logit_scale)

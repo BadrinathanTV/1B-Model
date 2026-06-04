@@ -10,7 +10,11 @@ Native Accelerate training loop with:
 """
 
 import argparse
+import bisect
+import glob
+import json
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import sys
 import time
 from dataclasses import asdict
@@ -47,14 +51,24 @@ except ImportError:
 _compiled_ce = torch.compile(F.cross_entropy)
 
 
-def _fused_ce_loss(hidden_states, lm_head_weight, targets, z_loss_weight=0.0):
+def _fused_ce_loss(hidden_states, lm_head_weight, targets, z_loss_weight=0.0, return_z_loss=False):
     """Compute CE loss via fused kernel — never materializes logits tensor."""
-    return LigerFusedLinearCrossEntropyFunction.apply(
+    res = LigerFusedLinearCrossEntropyFunction.apply(
         hidden_states.view(-1, hidden_states.size(-1)),
         lm_head_weight,
         targets.view(-1),
-        None, None, -100, z_loss_weight
-    )[0]
+        None,
+        None,
+        -100,
+        z_loss_weight,
+        0.0,
+        "mean",
+        None,
+        return_z_loss
+    )
+    if return_z_loss:
+        return res[0], res[1]
+    return res[0]
 
 
 def _standard_ce_loss(hidden_states, lm_head_weight, targets, vocab_size):
@@ -83,37 +97,53 @@ def compute_loss(hidden_states_list, targets, lm_head_weight, config: SLMConfig,
     main_h = hidden_states_list[0]
     use_fused = LIGER_FUSED_CE and main_h.is_cuda
 
+    z_loss = torch.tensor(0.0, device=main_h.device)
+
     # ── Main loss ──
     if is_superposition and targets.dim() == 3:
-        # TST Multi-Hot Cross-Entropy (MCE): L_MCE = (1/s) * sum_y CE(logits, y)
-        # targets shape: (B, S, s) — each position has s target tokens
+        # TST Multi-Hot Cross-Entropy (MCE)
+        # targets shape: (B, S, s)
         s = targets.shape[-1]
-        mce_loss = torch.tensor(0.0, device=main_h.device)
-        for j in range(s):
-            t_j = targets[:, :, j].contiguous()  # (B, S)
-            if use_fused:
-                mce_loss = mce_loss + _fused_ce_loss(main_h, lm_head_weight, t_j, config.z_loss_weight if j == 0 else 0.0)
-            else:
+        
+        if use_fused:
+            # Optimize: expand hidden states to match targets and batch the Liger call
+            # main_h: (B, S, H) -> (B, S, s, H)
+            main_h_expanded = main_h.unsqueeze(2).expand(-1, -1, s, -1).contiguous()
+            t_flattened = targets.contiguous()
+            
+            l_val, z_val = _fused_ce_loss(
+                main_h_expanded, lm_head_weight, t_flattened, 
+                config.z_loss_weight / s, return_z_loss=True
+            )
+            # Liger returns the mean over (B*S*s). Since MCE = (1/s) sum CE, 
+            # the mean over all items naturally scales by 1/s mathematically.
+            z_loss = z_loss + (z_val * s)  # z_val is scaled by config.z_loss_weight/s, so we multiply back
+            main_loss = l_val - z_val
+        else:
+            mce_loss = torch.tensor(0.0, device=main_h.device)
+            for j in range(s):
+                t_j = targets[:, :, j].contiguous()  # (B, S)
                 mce_loss = mce_loss + _standard_ce_loss(main_h, lm_head_weight, t_j, config.vocab_size)
-        main_loss = mce_loss / s
+            main_loss = mce_loss / s
     else:
         # Standard next-token CE
         if use_fused:
-            main_loss = _fused_ce_loss(main_h, lm_head_weight, targets, config.z_loss_weight)
+            l_val, z_val = _fused_ce_loss(main_h, lm_head_weight, targets, config.z_loss_weight, return_z_loss=True)
+            z_loss = z_val
+            main_loss = l_val - z_val
         else:
             main_loss = _standard_ce_loss(main_h, lm_head_weight, targets, config.vocab_size)
 
-    # ── Z-loss: penalize large logits to prevent softmax saturation ──
-    z_loss = torch.tensor(0.0, device=main_h.device)
+    # ── Z-loss for standard path ──
     if not use_fused and config.z_loss_weight > 0:
-        # Compute logits only for z-loss if not using Liger
-        with torch.no_grad():
-            main_logits = F.linear(main_h.detach().float(), lm_head_weight.float())
+        # Materialize logits with full gradient flow for Z-loss regularization
+        main_logits = F.linear(main_h.float(), lm_head_weight.float())
         log_z = torch.logsumexp(main_logits, dim=-1)
         z_loss = config.z_loss_weight * (log_z ** 2).mean()
 
     # ── MTP auxiliary losses with annealing ──
     mtp_loss = torch.tensor(0.0, device=main_h.device)
+    mtp_z_loss_total = torch.tensor(0.0, device=main_h.device)
     train_cfg = config.training
     anneal_step = int(train_cfg.max_steps * train_cfg.mtp_anneal_fraction)
     if step < anneal_step:
@@ -121,18 +151,63 @@ def compute_loss(hidden_states_list, targets, lm_head_weight, config: SLMConfig,
     else:
         mtp_weight = train_cfg.mtp_loss_weight_final
 
-    if len(hidden_states_list) > 1 and not is_superposition:
-        # MTP only during recovery phase (standard next-token prediction)
+    if len(hidden_states_list) > 1:
         for i in range(1, len(hidden_states_list)):
-            mtp_h = hidden_states_list[i][:, :-i, :].contiguous()
-            mtp_targets = targets[:, i:].contiguous()
-            if mtp_h.numel() == 0 or mtp_targets.numel() == 0:
-                continue
-            if use_fused:
-                mtp_loss = mtp_loss + _fused_ce_loss(mtp_h, lm_head_weight, mtp_targets, 0.0)
+            mtp_h = hidden_states_list[i]
+            if mtp_h.shape[1] == targets.shape[1]:
+                mtp_h = mtp_h[:, :-i, :].contiguous()
             else:
-                mtp_loss = mtp_loss + _standard_ce_loss(mtp_h, lm_head_weight, mtp_targets, config.vocab_size)
+                mtp_h = mtp_h.contiguous()
+            if mtp_h.numel() == 0:
+                continue
+            if is_superposition and targets.dim() == 3:
+                # TST Multi-Hot Cross-Entropy (MCE) for MTP
+                mtp_targets = targets[:, i:, :].contiguous()
+                if mtp_targets.numel() == 0:
+                    continue
+                s_mtp = mtp_targets.shape[-1]
+                
+                if use_fused:
+                    # Optimize: expand hidden states for MTP
+                    mtp_h_expanded = mtp_h.unsqueeze(2).expand(-1, -1, s_mtp, -1).contiguous()
+                    t_flattened = mtp_targets.contiguous()
+                    
+                    l_val, z_val = _fused_ce_loss(
+                        mtp_h_expanded, lm_head_weight, t_flattened, 
+                        config.z_loss_weight / s_mtp, return_z_loss=True
+                    )
+                    mtp_z_loss_total = mtp_z_loss_total + (z_val * s_mtp)
+                    mtp_loss = mtp_loss + (l_val - z_val)
+                else:
+                    mtp_mce = torch.tensor(0.0, device=main_h.device)
+                    for j in range(s_mtp):
+                        t_j = mtp_targets[:, :, j].contiguous()
+                        mtp_mce = mtp_mce + _standard_ce_loss(mtp_h, lm_head_weight, t_j, config.vocab_size)
+                    
+                    if config.z_loss_weight > 0:
+                        mtp_logits = F.linear(mtp_h.float(), lm_head_weight.float())
+                        log_z_mtp = torch.logsumexp(mtp_logits, dim=-1)
+                        mtp_z_loss_total = mtp_z_loss_total + config.z_loss_weight * (log_z_mtp ** 2).mean()
+                    mtp_loss = mtp_loss + (mtp_mce / s_mtp)
+            else:
+                # Standard next-token CE for MTP
+                mtp_targets = targets[:, i:].contiguous()
+                if mtp_targets.numel() == 0:
+                    continue
+                if use_fused:
+                    l_val, z_val = _fused_ce_loss(mtp_h, lm_head_weight, mtp_targets, config.z_loss_weight, return_z_loss=True)
+                    mtp_z_loss_total = mtp_z_loss_total + z_val
+                    mtp_loss = mtp_loss + (l_val - z_val)
+                else:
+                    mtp_loss = mtp_loss + _standard_ce_loss(mtp_h, lm_head_weight, mtp_targets, config.vocab_size)
+                    if config.z_loss_weight > 0:
+                        mtp_logits = F.linear(mtp_h.float(), lm_head_weight.float())
+                        log_z_mtp = torch.logsumexp(mtp_logits, dim=-1)
+                        z_val = config.z_loss_weight * (log_z_mtp ** 2).mean()
+                        mtp_z_loss_total = mtp_z_loss_total + z_val
 
+    # Scale and add MTP's Z-loss to the total Z-loss metric
+    z_loss = z_loss + mtp_weight * mtp_z_loss_total
     total_loss = main_loss + z_loss + mtp_weight * mtp_loss
 
     # Return raw tensors — .item() causes a CPU-GPU sync that stalls the pipeline.
@@ -146,7 +221,6 @@ def compute_loss(hidden_states_list, targets, lm_head_weight, config: SLMConfig,
     return total_loss, metrics
 
 
-import glob
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 
@@ -177,7 +251,7 @@ class PretrainingDataset(Dataset):
             for f in self.files:
                 m = np.memmap(f, dtype=np.uint16, mode='r')
                 self.memmaps.append(m)
-                valid_len = max(0, len(m) - self.chunk_size)
+                valid_len = len(m) // self.chunk_size
                 self.cumulative_lengths.append(self.cumulative_lengths[-1] + valid_len)
             self.total_length = self.cumulative_lengths[-1]
             self.use_dummy = False
@@ -192,24 +266,26 @@ class PretrainingDataset(Dataset):
         s = self.tst_group_size
 
         if self.use_dummy:
-            inputs = torch.randint(0, self.vocab_size, (self.input_seq_len,))
             if s > 1:
-                # MCE targets: each position predicts the next bag of s tokens
+                inputs = torch.randint(0, self.vocab_size, (self.seq_len, s))
                 targets = torch.randint(0, self.vocab_size, (self.seq_len, s))
             else:
+                inputs = torch.randint(0, self.vocab_size, (self.input_seq_len,))
                 targets = torch.randint(0, self.vocab_size, (self.seq_len,))
             return inputs, targets
 
-        import bisect
         file_idx = bisect.bisect_right(self.cumulative_lengths, index) - 1
         if file_idx >= len(self.files): file_idx = len(self.files) - 1
-        local_idx = index - self.cumulative_lengths[file_idx]
+        local_chunk_idx = index - self.cumulative_lengths[file_idx]
+        local_idx = local_chunk_idx * self.chunk_size
 
         chunk = self.memmaps[file_idx][local_idx : local_idx + self.chunk_size]
         chunk = torch.from_numpy(chunk.astype(np.int64))
 
-        # Inputs: first input_seq_len tokens (will be averaged in embedding layer if s > 1)
+        # Inputs: first input_seq_len tokens (folded into (seq_len, group_size) if s > 1)
         inputs = chunk[:self.input_seq_len]
+        if s > 1:
+            inputs = inputs.view(self.seq_len, s)
 
         if s > 1:
             # TST Superposition Phase: Multi-hot targets
@@ -246,9 +322,10 @@ def evaluate(model, dataloader, accelerator, config, lm_head_weight, is_superpos
                 hidden_states_list = model(
                     inputs, freqs_cis=freqs_cis,
                     cos_cache=cos_cache, sin_cache=sin_cache,
-                    use_mtp=config.use_mtp and not is_superposition,
+                    use_mtp=config.use_mtp,
                     return_hidden_states=True,
                     tst_group_size=config.tst_group_size if is_superposition else 1,
+                    target_ids=targets,
                 )
                 loss, _ = compute_loss(
                     hidden_states_list, targets, lm_head_weight, config, 0,
@@ -295,7 +372,10 @@ def main():
     train_cfg = config.training
 
     # ── Accelerator ──
-    accelerator = Accelerator(mixed_precision="bf16")
+    accelerator = Accelerator(
+        mixed_precision="bf16",
+        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
+    )
     accelerator.print(config, flush=True)
     torch.manual_seed(train_cfg.seed)
 
@@ -317,7 +397,7 @@ def main():
     if args.compile:
         accelerator.print("      Compiling individual TransformerBlocks...", flush=True)
         for i in range(len(model.layers)):
-            model.layers[i] = torch.compile(model.layers[i])
+            model.layers[i] = torch.compile(model.layers[i])  # type: ignore
     param_count = sum(p.numel() for p in model.parameters())
     vram_mb = torch.cuda.memory_allocated() / 1024**2
     accelerator.print(f"      Done in {time.time()-t0:.1f}s — {param_count/1e9:.3f}B params, {vram_mb:.0f} MB VRAM", flush=True)
@@ -391,11 +471,11 @@ def main():
     if dataset_super.use_dummy:
         accelerator.print("      Warning: No .bin files found in data_dir, falling back to dummy data.", flush=True)
 
-    def make_dataloader(ds):
+    def make_dataloader(ds, shuffle=True):
         dl = DataLoader(
             ds,
             batch_size=train_cfg.batch_size,
-            shuffle=False,
+            shuffle=shuffle,
             num_workers=4,
             pin_memory=True,
             drop_last=True,
@@ -403,21 +483,32 @@ def main():
         )
         return accelerator.prepare(dl)
 
-    dataloader_super = make_dataloader(dataset_super)
-    dataloader_recovery = make_dataloader(dataset_recovery)
+    dataloader_super = make_dataloader(dataset_super, shuffle=True)
+    dataloader_recovery = make_dataloader(dataset_recovery, shuffle=True)
     
-    # ── Validation Dataloader ──
-    dataloader_val = None
+    # ── Validation Dataloaders ──
+    dataloader_val_super = None
+    dataloader_val_recovery = None
     if args.val_data_dir and os.path.exists(args.val_data_dir):
-        accelerator.print("      Setting up validation dataloader...", flush=True)
-        dataset_val = PretrainingDataset(
+        accelerator.print("      Setting up validation dataloaders...", flush=True)
+        if is_superposition:
+            dataset_val_super = PretrainingDataset(
+                data_dir=args.val_data_dir,
+                input_seq_len=input_seq_len,
+                seq_len=seq_len,
+                vocab_size=config.vocab_size,
+                tst_group_size=config.tst_group_size,
+            )
+            dataloader_val_super = make_dataloader(dataset_val_super, shuffle=False)
+
+        dataset_val_recovery = PretrainingDataset(
             data_dir=args.val_data_dir,
             input_seq_len=seq_len,
             seq_len=seq_len,
             vocab_size=config.vocab_size,
-            tst_group_size=1, # Eval in recovery mode
+            tst_group_size=1,
         )
-        dataloader_val = make_dataloader(dataset_val)
+        dataloader_val_recovery = make_dataloader(dataset_val_recovery, shuffle=False)
 
     accelerator.print("      Done.\n", flush=True)
 
@@ -426,7 +517,6 @@ def main():
     resume_dir = None
     if os.path.exists(args.checkpoint_dir):
         # Find latest checkpoint-X folder
-        import glob
         subdirs = glob.glob(os.path.join(args.checkpoint_dir, "checkpoint-*"))
         if subdirs:
             try:
@@ -462,10 +552,17 @@ def main():
 
     model.train()
 
-    # Start with superposition dataloader
-    current_phase = "superposition" if is_superposition else "recovery"
-    data_iter = iter(dataloader_super if is_superposition else dataloader_recovery)
-    phase_switched = False
+    # Determine correct TST phase based on resume step
+    if global_step >= tst_superposition_step:
+        current_phase = "recovery"
+        data_iter = iter(dataloader_recovery)
+        phase_switched = True
+        if global_step > 0:
+            accelerator.print(f"  Resumed in RECOVERY phase (step {global_step} >= transition step {tst_superposition_step})", flush=True)
+    else:
+        current_phase = "superposition" if is_superposition else "recovery"
+        data_iter = iter(dataloader_super if is_superposition else dataloader_recovery)
+        phase_switched = False
 
     for step in range(global_step, train_cfg.max_steps):
         # ── TST Phase Transition Check ──
@@ -485,6 +582,7 @@ def main():
         t_step = time.time()
         accum_loss = torch.tensor(0.0, device=accelerator.device)
         accum_metrics = {}
+        grad_norm = None
 
         for micro_step in range(grad_accum_steps):
             try:
@@ -500,9 +598,10 @@ def main():
                 hidden_states_list = model(
                     inputs, freqs_cis=freqs_cis,
                     cos_cache=cos_cache, sin_cache=sin_cache,
-                    use_mtp=config.use_mtp and not in_superposition,
+                    use_mtp=config.use_mtp,
                     return_hidden_states=True,
                     tst_group_size=config.tst_group_size if in_superposition else 1,
+                    target_ids=targets,
                 )
                 loss, metrics = compute_loss(
                     hidden_states_list, targets, lm_head_weight, config, step,
@@ -530,7 +629,7 @@ def main():
 
                     # Provide closure to fetch loss for Polyak step-size
                     def closure():
-                        return loss.detach()
+                        return accum_loss / grad_accum_steps
                     optimizer.step(closure=closure)
                     optimizer.zero_grad(set_to_none=True)
 
@@ -538,33 +637,41 @@ def main():
         if (step + 1) % train_cfg.log_interval == 0:
             vram = torch.cuda.memory_allocated() / 1024**2
             elapsed = time.time() - t_step
-            tokens = train_cfg.batch_size * grad_accum_steps * seq_len * config.tst_group_size
+            # Fix #2: Use correct group_size based on current phase
+            effective_group_size = config.tst_group_size if in_superposition else 1
+            tokens = train_cfg.batch_size * grad_accum_steps * seq_len * effective_group_size
             tps = tokens / elapsed
             # Extract metrics to CPU only at log time
-            main_loss_val = accum_metrics.get('main_loss', torch.tensor(0.0))
-            z_loss_val = accum_metrics.get('z_loss', torch.tensor(0.0))
-            mtp_loss_val = accum_metrics.get('mtp_loss', torch.tensor(0.0))
+            avg_loss = (accum_loss / grad_accum_steps).item()
+            main_loss_val = (accum_metrics.get('main_loss', torch.tensor(0.0)) / grad_accum_steps).item()
+            z_loss_val = (accum_metrics.get('z_loss', torch.tensor(0.0)) / grad_accum_steps).item()
+            mtp_loss_val = (accum_metrics.get('mtp_loss', torch.tensor(0.0)) / grad_accum_steps).item()
+            # Calculate current MTP weight based on step
+            anneal_step = int(train_cfg.max_steps * train_cfg.mtp_anneal_fraction)
+            mtp_weight_val = train_cfg.mtp_loss_weight if step < anneal_step else train_cfg.mtp_loss_weight_final
             accelerator.print(
                 f"  Step {step+1}/{train_cfg.max_steps} | "
-                f"Loss: {accum_loss.item():.4f} | "
-                f"Main: {main_loss_val.item() if isinstance(main_loss_val, torch.Tensor) else main_loss_val:.4f} | "
-                f"Z: {z_loss_val.item() if isinstance(z_loss_val, torch.Tensor) else z_loss_val:.6f} | "
-                f"MTP: {mtp_loss_val.item() if isinstance(mtp_loss_val, torch.Tensor) else mtp_loss_val:.4f} (w={accum_metrics.get('mtp_weight', 0):.2f}) | "
+                f"Loss: {avg_loss:.4f} | "
+                f"Main: {main_loss_val:.4f} | "
+                f"Z: {z_loss_val:.6f} | "
+                f"MTP: {mtp_loss_val:.4f} (w={mtp_weight_val:.2f}) | "
                 f"VRAM: {vram:.0f} MB | "
                 f"TPS: {tps:.0f} tok/s | "
                 f"Time: {elapsed:.2f}s",
                 flush=True,
             )
             if accelerator.is_main_process:
+                # Fix #15: Log Python floats, not GPU tensors (avoids CPU-GPU sync)
                 log_dict = {
-                    "loss": accum_loss,
-                    "main_loss": accum_metrics.get("main_loss", 0),
-                    "z_loss": accum_metrics.get("z_loss", 0),
-                    "mtp_loss": accum_metrics.get("mtp_loss", 0),
-                    "mtp_weight": accum_metrics.get("mtp_weight", 0),
+                    "loss": avg_loss,
+                    "main_loss": main_loss_val,
+                    "z_loss": z_loss_val,
+                    "mtp_loss": mtp_loss_val,
+                    "mtp_weight": mtp_weight_val,
                     "vram_mb": vram,
                     "tps": tps,
                     "elapsed_time": elapsed,
+                    "phase": current_phase,
                 }
                 # Gradient norm monitoring (spike detection)
                 if grad_norm is not None:
@@ -584,19 +691,26 @@ def main():
             # Save Checkpoint
             ckpt_path = os.path.join(args.checkpoint_dir, f"checkpoint-{step+1}")
             accelerator.save_state(ckpt_path)
+            # Save training state for robust resume
             if accelerator.is_main_process:
-                with open(os.path.join(ckpt_path, "step.txt"), "w") as f:
-                    f.write(str(step + 1))
+                training_state = {
+                    "global_step": step + 1,
+                    "phase": current_phase,
+                    "phase_switched": phase_switched,
+                }
+                with open(os.path.join(ckpt_path, "training_state.json"), "w") as f:
+                    json.dump(training_state, f)
             accelerator.print(f"\nSaved checkpoint to {ckpt_path} at step {step+1}", flush=True)
             
             # Run Validation
-            if dataloader_val is not None:
-                accelerator.print("Running validation...", flush=True)
+            val_loader = dataloader_val_super if (in_superposition and dataloader_val_super is not None) else dataloader_val_recovery
+            if val_loader is not None:
+                accelerator.print(f"Running validation ({'superposition' if in_superposition else 'recovery'})...", flush=True)
                 val_loss = evaluate(
-                    model, dataloader_val, accelerator, config, lm_head_weight,
-                    False, freqs_cis, cos_cache, sin_cache, eval_steps=50
+                    model, val_loader, accelerator, config, lm_head_weight,
+                    in_superposition, freqs_cis, cos_cache, sin_cache, eval_steps=50
                 )
-                accelerator.print(f"  Validation Loss: {val_loss:.4f}\n", flush=True)
+                accelerator.print(f"  Validation Loss ({'superposition' if in_superposition else 'recovery'}): {val_loss:.4f}\n", flush=True)
                 if accelerator.is_main_process:
                     wandb.log({"val_loss": val_loss}, step=step + 1)
 
@@ -604,11 +718,24 @@ def main():
             if hasattr(optimizer, 'train'):
                 optimizer.train()
 
-    # Switch to eval mode for Schedule-Free averaged weights before saving
+    # ── Save final checkpoint (Fix #9: don't lose last N steps) ──
+    accelerator.wait_for_everyone()
     if hasattr(optimizer, 'eval'):
         optimizer.eval()
 
-    accelerator.print("\n✓ Training complete! BF16 pipeline is functional.", flush=True)
+    final_step = train_cfg.max_steps
+    ckpt_path = os.path.join(args.checkpoint_dir, f"checkpoint-{final_step}")
+    accelerator.save_state(ckpt_path)
+    if accelerator.is_main_process:
+        training_state = {
+            "global_step": final_step,
+            "phase": current_phase,
+            "phase_switched": phase_switched,
+        }
+        with open(os.path.join(ckpt_path, "training_state.json"), "w") as f:
+            json.dump(training_state, f)
+
+    accelerator.print(f"\n✓ Training complete! Final checkpoint saved to {ckpt_path}", flush=True)
     if accelerator.is_main_process:
         wandb.finish()
 

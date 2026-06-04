@@ -82,7 +82,7 @@ def build_optimizer(model: torch.nn.Module, config: SLMConfig) -> torch.optim.Op
             param_groups,
             sf_beta1=0.9,
             sf_beta1_max=0.965,
-            sf_beta1_anneal_steps=opt_cfg.training_steps if hasattr(opt_cfg, 'training_steps') else 40000,
+            sf_beta1_anneal_steps=config.training.max_steps,
             polyak_beta=0.9,
             c_warmup=c_warmup,
             r=1.0
@@ -100,7 +100,7 @@ def build_optimizer(model: torch.nn.Module, config: SLMConfig) -> torch.optim.Op
             param_groups,
             sf_beta1=0.9,
             sf_beta1_max=0.965,
-            sf_beta1_anneal_steps=opt_cfg.training_steps if hasattr(opt_cfg, 'training_steps') else 40000,
+            sf_beta1_anneal_steps=config.training.max_steps,
             polyak_beta=0.9, # Standard EMA for Polyak L1 norm
             c_warmup=c_warmup,
             r=1.0 # Long duration weighting

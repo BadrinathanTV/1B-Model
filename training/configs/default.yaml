@@ -22,6 +22,7 @@ model:
 
   # TST (Token Superposition Training)
   tst_group_size: 4
+  tst_superposition_ratio: 0.2   # 20% of max_steps in superposition phase (paper: 20-40%)
 
   # MTP (Multi-Token Prediction)
   mtp_depth: 2
@@ -42,7 +43,7 @@ model:
 
   # Weight Tying & Memory Optimizations
   tie_word_embeddings: true
-  max_delta_history: 8
+  max_delta_history: 2
   gradient_checkpointing: true
   gradient_checkpointing_interval: 1
 
@@ -63,9 +64,9 @@ optimizer:
 
 # ─── Training ─────────────────────────────────────────────────────────────────
 training:
-  batch_size: 20 # per GPU (middle ground between 16 and 24 for optimal VRAM utilization)
-  gradient_accumulation_steps: 102
-  seq_len: 1024 # (4 * 512 * 4096 = 8.38M tokens global batch size per step with TST=4)
+  batch_size: 32 # The PROVEN config that achieved 26k TPS
+  gradient_accumulation_steps: 64  # 32 * 64 = 2048
+  seq_len: 1024
   max_steps: 5960
   mtp_loss_weight: 0.3
   mtp_loss_weight_final: 0.1         # Anneal to this after mtp_anneal_fraction of training

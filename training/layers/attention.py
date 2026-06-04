@@ -59,8 +59,8 @@ class MultiHeadLatentAttention(nn.Module):
         k = self.k_up_proj(kv_c).view(batch_size, seq_len, self.num_heads, self.v_head_dim)
         v = self.v_up_proj(kv_c).view(batch_size, seq_len, self.num_heads, self.v_head_dim)
         
-        # Expand k_rope to all heads
-        k_rope = k_rope.view(batch_size, seq_len, 1, self.qk_rope_head_dim).expand(-1, -1, self.num_heads, -1)
+        # FIX 1: Add .contiguous() after expand to prevent Liger kernel stride-0 crash
+        k_rope = k_rope.view(batch_size, seq_len, 1, self.qk_rope_head_dim).expand(-1, -1, self.num_heads, -1).contiguous()
         
         # Apply RoPE rotary embeddings (required for positional awareness)
         if freqs_cis is None:
@@ -84,8 +84,16 @@ class MultiHeadLatentAttention(nn.Module):
         k_full = k_full.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
         
+        # FIX 2: DeepSeek Padding Trick for FlashAttention
+        # Pad V's head dimension with zeros to match Q/K, otherwise SDPA silently 
+        # disables FlashAttention and falls back to Math (instant OOM).
+        v_padded = F.pad(v, (0, self.qk_rope_head_dim))
+        
         # Use cuDNN/Triton optimized SDPA 
-        attn_output = F.scaled_dot_product_attention(q_full, k_full, v, is_causal=True)
+        attn_output = F.scaled_dot_product_attention(q_full, k_full, v_padded, is_causal=True)
+        
+        # Slice off the padding we just added
+        attn_output = attn_output[..., :self.v_head_dim]
         
         # Reshape and project out
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)

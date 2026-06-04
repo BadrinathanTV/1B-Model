@@ -30,8 +30,7 @@ class TestDenseFFN(unittest.TestCase):
         loss.backward()
         
         self.assertIsNotNone(x.grad)
-        self.assertIsNotNone(ffn.gate_proj.weight.grad)
-        self.assertIsNotNone(ffn.up_proj.weight.grad)
+        self.assertIsNotNone(ffn.gate_up_proj.weight.grad)
         self.assertIsNotNone(ffn.down_proj.weight.grad)
 
     def test_liger_fallback_equivalence(self):
