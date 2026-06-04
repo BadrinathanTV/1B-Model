@@ -77,7 +77,8 @@ class MTPModule(nn.Module):
             
         if ids.dim() == 3:
             # TST superposition phase: ids is (B, S, s) -> embs is (B, S, s, H). Average over the group dimension.
-            embs = embs.mean(dim=2)
+            orig_dtype = embs.dtype
+            embs = embs.float().mean(dim=2).to(orig_dtype)
             
         return embs
 
