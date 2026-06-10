@@ -28,6 +28,10 @@ class AuroraConfig:
     momentum: float = 0.95
     weight_decay: float = 0.1
     nesterov: bool = True
+    use_riemannian: bool = True
+    update_clip: float = 0.1
+    pp_iterations: int = 2
+    pp_beta: float = 0.5
 
 
 @dataclass
@@ -42,7 +46,7 @@ class AdamWConfig:
 @dataclass
 class OptimizerConfig:
     """Top-level optimizer configuration with param-group routing."""
-    type: str = "hybrid"            # "hybrid" | "nf_aurora" | "adamw"
+    type: str = "hybrid"            # "hybrid" | "adamw"
     base_lr: float = 1e-3
     warmup_steps: int = 2000
     aurora: AuroraConfig = field(default_factory=AuroraConfig)
@@ -65,13 +69,11 @@ class TrainingConfig:
     seq_len: int = 512
     max_steps: int = 5
     gradient_accumulation_steps: int = 8
-    mtp_loss_weight: float = 0.3
-    mtp_loss_weight_final: float = 0.1     # Anneal MTP weight to this value
-    mtp_anneal_fraction: float = 0.67      # Fraction of training to start annealing
     gradient_clip: float = 1.0
     log_interval: int = 1
     seed: int = 42
     device: str = "auto"            # "auto" | "cuda" | "cpu"
+    learning_rate: float = 1e-3     # Alias for optimizer.base_lr (used by some tests)
 
 
 # ─── Main Config ─────────────────────────────────────────────────────────────
@@ -111,15 +113,9 @@ class SLMConfig:
     yarn_beta_fast: float = 32.0       # YaRN beta fast (high frequency cutoff)
     yarn_beta_slow: float = 1.0        # YaRN beta slow (low frequency cutoff)
 
-    # TST (Token Superposition Training) — Two-Phase
-    #   Phase 1 (Superposition): MCE loss on bags of tst_group_size tokens
-    #   Phase 2 (Recovery): Standard next-token prediction (tst_group_size→1)
-    tst_group_size: int = 2
-    tst_superposition_ratio: float = 0.3  # Fraction of max_steps in superposition phase (paper: 20-40%)
-
     # MTP (Multi-Token Prediction)
-    mtp_depth: int = 2
-    use_mtp: bool = True
+    mtp_depth: int = 1                 # Number of future tokens to predict (1 = standard NTP)
+    use_mtp: bool = True               # Whether to use MTP heads during inference
 
     # Stability: Weight Initialization
     init_std: float = 0.02             # Truncated normal sigma (DeepSeek-V3 uses 0.006)
@@ -163,18 +159,16 @@ class SLMConfig:
             raise ValueError(
                 f"qk_rope_head_dim ({self.qk_rope_head_dim}) must be even for complex RoPE"
             )
-        if self.tst_group_size < 1:
-            raise ValueError(f"tst_group_size must be >= 1, got {self.tst_group_size}")
-        if self.mtp_depth < 1:
-            raise ValueError(f"mtp_depth must be >= 1, got {self.mtp_depth}")
         if self.output_logit_scale <= 0.0:
             raise ValueError(f"output_logit_scale must be positive, got {self.output_logit_scale}")
         if self.max_delta_history < 0:
             raise ValueError(f"max_delta_history must be >= 0, got {self.max_delta_history}")
+        if self.mtp_depth < 1:
+            raise ValueError(f"mtp_depth must be >= 1, got {self.mtp_depth}")
 
-        if self.optimizer.type not in ("hybrid", "nf_aurora", "sf_normuon", "adamw", "nf_aurora_hybrid", "nf_normuon_hybrid"):
+        if self.optimizer.type not in ("hybrid", "adamw"):
             raise ValueError(
-                f"optimizer.type must be 'hybrid', 'nf_aurora', 'sf_normuon', 'adamw', 'nf_aurora_hybrid', or 'nf_normuon_hybrid', "
+                f"optimizer.type must be 'hybrid' or 'adamw', "
                 f"got '{self.optimizer.type}'"
             )
 
@@ -248,7 +242,6 @@ class SLMConfig:
             f"{self.num_attention_heads}H / {self.vocab_size}V\n"
             f"  MLA: q_lora={self.q_lora_rank}, kv_lora={self.kv_lora_rank}, "
             f"rope_dim={self.qk_rope_head_dim}\n"
-            f"  TST: group_size={self.tst_group_size}\n"
             f"  MTP: depth={self.mtp_depth}\n"
             f"  optimizer: {self.optimizer.type} @ lr={self.optimizer.base_lr}\n"
             f"  training: bs={self.training.batch_size}, seq={self.training.seq_len}, "

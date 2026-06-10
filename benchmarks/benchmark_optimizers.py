@@ -12,21 +12,7 @@ from config import SLMConfig
 from model import SLMModel
 from optimizers import build_optimizer
 from layers.rope import precompute_freqs_cis, precompute_cos_sin
-
-# Wrap loss in compile just like train.py
-_compiled_ce = torch.compile(F.cross_entropy)
-
-def compute_loss(logits_list, targets, config: SLMConfig) -> torch.Tensor:
-    main_logits = logits_list[0]
-    loss = _compiled_ce(main_logits.view(-1, config.vocab_size), targets.view(-1))
-    if config.mtp_depth > 1:
-        mtp_weight = config.training.mtp_loss_weight
-        for i in range(1, config.mtp_depth):
-            mtp_logits = logits_list[i][:, :-i, :].contiguous()
-            mtp_targets = targets[:, i:].contiguous()
-            if mtp_logits.numel() == 0 or mtp_targets.numel() == 0: continue
-            loss += mtp_weight * _compiled_ce(mtp_logits.view(-1, config.vocab_size), mtp_targets.view(-1))
-    return loss
+from train import compute_loss
 
 def run_benchmark(opt_type, config, device, steps=50, warmup=10):
     print(f"\n{'='*50}\nBenchmarking: {opt_type.upper()}\n{'='*50}")
@@ -45,8 +31,7 @@ def run_benchmark(opt_type, config, device, steps=50, warmup=10):
     # 3. Dummy Data
     bs = config.training.batch_size
     seq = config.training.seq_len
-    # Need inputs and targets
-    inputs = torch.randint(0, config.vocab_size, (bs, seq * config.tst_group_size), device=device)
+    inputs = torch.randint(0, config.vocab_size, (bs, seq), device=device)
     targets = torch.randint(0, config.vocab_size, (bs, seq), device=device)
     
     # Precompute RoPE
@@ -59,11 +44,10 @@ def run_benchmark(opt_type, config, device, steps=50, warmup=10):
     # Warmup
     print(f"Running {warmup} warmup steps...")
     for _ in range(warmup):
-        logits_list = model(inputs, freqs_cis=freqs_cis, cos_cache=cos_cache, sin_cache=sin_cache)
-        loss = compute_loss(logits_list, targets, config)
+        hidden_states_list = model(inputs, freqs_cis=freqs_cis, cos_cache=cos_cache, sin_cache=sin_cache, return_hidden_states=True)
+        loss, _ = compute_loss(hidden_states_list, targets, model.lm_head.weight, config)
         loss.backward()
-        def closure(): return loss.item()
-        optimizer.step(closure=closure) if hasattr(optimizer, 'step') else optimizer.step()
+        optimizer.step()
         optimizer.zero_grad(set_to_none=True)
     
     torch.cuda.synchronize()
@@ -73,11 +57,10 @@ def run_benchmark(opt_type, config, device, steps=50, warmup=10):
     print(f"Running {steps} benchmark steps...")
     t0 = time.time()
     for _ in range(steps):
-        logits_list = model(inputs, freqs_cis=freqs_cis, cos_cache=cos_cache, sin_cache=sin_cache)
-        loss = compute_loss(logits_list, targets, config)
+        hidden_states_list = model(inputs, freqs_cis=freqs_cis, cos_cache=cos_cache, sin_cache=sin_cache, return_hidden_states=True)
+        loss, _ = compute_loss(hidden_states_list, targets, model.lm_head.weight, config)
         loss.backward()
-        def closure(): return loss.item()
-        optimizer.step(closure=closure) if hasattr(optimizer, 'step') else optimizer.step()
+        optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         
     torch.cuda.synchronize()
@@ -90,7 +73,7 @@ def run_benchmark(opt_type, config, device, steps=50, warmup=10):
     print(f"Peak VRAM     : {peak_vram:.0f} MB")
     
     # Free memory
-    del model, optimizer, inputs, targets, loss, logits_list
+    del model, optimizer, inputs, targets, loss, hidden_states_list
     torch.cuda.empty_cache()
     
     return time_per_step, peak_vram
@@ -98,7 +81,6 @@ def run_benchmark(opt_type, config, device, steps=50, warmup=10):
 def main():
     device = "cuda"
     
-    # Scale down slightly to fit in 16GB VRAM without DeepSpeed/Gradient Checkpointing
     config = SLMConfig()
     config.num_hidden_layers = 12  # ~500M params for testing
     config.training.batch_size = 2
@@ -106,7 +88,7 @@ def main():
     
     print(f"Benchmarking on {device}")
     
-    optimizers_to_test = ["nf_aurora_hybrid", "nf_normuon_hybrid"]
+    optimizers_to_test = ["hybrid", "adamw"]
     results = {}
     
     for opt in optimizers_to_test:
@@ -115,10 +97,10 @@ def main():
             results[opt] = {"ms": ms, "vram": vram}
         except Exception as e:
             print(f"Failed to benchmark {opt}: {e}")
-            results[opt] = {"ms": float('inf'), "vram": float('inf')}
+            results[opt] = {"ms": float('inf'), 'vram': float('inf')}
             
     print("\n\n" + "="*50)
-    print("FINAL BENCHMARK RESULTS (Custom Triton/Liger Stack)")
+    print("FINAL BENCHMARK RESULTS")
     print("="*50)
     print(f"{'Optimizer':<15} | {'ms / step':<10} | {'Peak VRAM':<10} | {'Speedup':<10}")
     print("-"*50)

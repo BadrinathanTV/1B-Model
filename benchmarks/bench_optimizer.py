@@ -14,9 +14,8 @@ from models.transformer import SLMModel
 
 def create_model_and_optimizer(opt_type, device, dtype):
     config = SLMConfig()
-    # scale down just a little bit for faster setup if needed, but keeping it 1B is best for realistic timing
     config.hidden_size = 1280
-    config.num_hidden_layers = 12 # half depth for benchmarking just the step time
+    config.num_hidden_layers = 12 # half depth for benchmarking
     
     config.optimizer.type = opt_type
     
@@ -30,7 +29,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
     
-    opts_to_test = ["sf_normuon", "adamw"]
+    opts_to_test = ["hybrid", "adamw"]
     
     results = {}
     
@@ -44,11 +43,7 @@ def main():
                 p.grad = torch.randn_like(p)
                 
         def step_fn():
-            if opt_type == "sf_normuon":
-                def closure(): return 1.0 # dummy loss
-                optimizer.step(closure=closure)
-            else:
-                optimizer.step()
+            optimizer.step()
                 
         print(f"Benchmarking {opt_type}...")
         

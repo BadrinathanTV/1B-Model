@@ -1,6 +1,6 @@
 """
 Optimizer Factory
-==================
+=================
 
 Builds the optimizer from an SLMConfig, automatically routing parameters
 to the correct optimizer group.
@@ -59,52 +59,26 @@ def build_optimizer(model: torch.nn.Module, config: SLMConfig) -> torch.optim.Op
         {
             "params": aurora_params,
             "lr": opt_cfg.base_lr,
-            "use_aurora": True, # This flag triggers the SF-NorMuon 2D path
+            "use_aurora": True,
+            "use_riemannian": aurora_cfg.use_riemannian,
+            "update_clip": aurora_cfg.update_clip,
             "weight_decay": aurora_cfg.weight_decay,
+            "pp_iterations": aurora_cfg.pp_iterations,
+            "pp_beta": aurora_cfg.pp_beta,
+            "momentum": aurora_cfg.momentum,
         },
         {
             "params": adam_params,
             "lr": opt_cfg.base_lr * adamw_cfg.lr_scale,
-            "use_aurora": False, # This flag triggers the AdamC Polyak path
+            "use_aurora": False,
             "weight_decay": adamw_cfg.weight_decay,
+            "eps": adamw_cfg.eps,
+            "betas": adamw_cfg.betas,
         },
     ]
 
     if opt_cfg.type == "hybrid":
         return HybridSLMOptimizer(param_groups)
-    elif opt_cfg.type == "nf_aurora_hybrid":
-        from .nf_aurora_hybrid import NFAuroraHybrid
-        return NFAuroraHybrid(param_groups)
-    elif opt_cfg.type == "nf_normuon_hybrid":
-        from .nf_normuon_hybrid import NFNorMuonHybrid
-        c_warmup = opt_cfg.warmup_steps * 2
-        return NFNorMuonHybrid(
-            param_groups,
-            sf_beta1=0.9,
-            sf_beta1_max=0.965,
-            sf_beta1_anneal_steps=config.training.max_steps,
-            polyak_beta=0.9,
-            c_warmup=c_warmup,
-            r=1.0
-        )
-    elif opt_cfg.type == "nf_aurora":
-        from .nf_aurora import NFAurora
-        return NFAurora(param_groups)
-    elif opt_cfg.type == "sf_normuon":
-        from .sf_normuon import SFNorMuon
-        # Compute c_warmup based on warmup_steps (2x as recommended by paper)
-        c_warmup = opt_cfg.warmup_steps * 2
-        # Paper uses same LR for 1D and 2D parameters
-        param_groups[1]["lr"] = opt_cfg.base_lr
-        return SFNorMuon(
-            param_groups,
-            sf_beta1=0.9,
-            sf_beta1_max=0.965,
-            sf_beta1_anneal_steps=config.training.max_steps,
-            polyak_beta=0.9, # Standard EMA for Polyak L1 norm
-            c_warmup=c_warmup,
-            r=1.0 # Long duration weighting
-        )
     elif opt_cfg.type == "adamw":
         # standard AdamW (filter out non-AdamW keys)
         adam_groups = []

@@ -129,6 +129,7 @@ def aurora(
     pp_iterations: int = 2,
     pp_beta: float = 0.5,
     eps: float = 1e-7,
+    update_clip: float = 0.0,
 ) -> torch.Tensor:
     """Vanilla Aurora leverage-aware optimizer for rectangular matrices.
 
@@ -193,6 +194,10 @@ def aurora(
 
     # Spectral aspect-ratio scaling (Muon convention).
     update *= max(1, G.size(-2) / G.size(-1)) ** 0.5
+    
+    if update_clip > 0.0:
+        update.clamp_(-update_clip, update_clip)
+
     if not update.isfinite().all():
         raise RuntimeError(
             f"aurora produced non-finite update for parameter of shape {tuple(W.shape)}. "
@@ -218,6 +223,7 @@ def riemannian_aurora(
     riemannian_eta: float = 0.1,
     retraction_steps: int = 2,
     eps: float = 1e-7,
+    update_clip: float = 0.0,
 ) -> torch.Tensor:
     """Riemannian leverage-aware polar update optimizer for rectangular matrices.
 
@@ -264,6 +270,9 @@ def riemannian_aurora(
 
     # Spectral aspect-ratio scaling (Muon convention).
     update *= max(1, G.size(-2) / G.size(-1)) ** 0.5
+
+    if update_clip > 0.0:
+        update.clamp_(-update_clip, update_clip)
 
     # Decoupled weight decay then apply.
     W.mul_(1 - eta * weight_decay)

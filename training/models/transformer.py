@@ -19,8 +19,7 @@ from layers.norm import RMSNorm
 from layers.attention import MultiHeadLatentAttention
 from layers.ffn import DenseFFN
 from layers.residual import DeltaAttentionResidual
-from models.embedding import TokenSuperpositionEmbedding
-from models.mtp import MTPModule
+from models.embedding import Embedding
 
 
 class TransformerBlock(nn.Module):
@@ -97,7 +96,7 @@ class TransformerBlock(nn.Module):
 
 
 class SLMModel(nn.Module):
-    """The full 1B SLM integrating Delta Residuals, MLA, Dense FFN, TST, and MTP.
+    """The full 1B SLM integrating Delta Residuals, MLA, Dense FFN, and MTP.
 
     Stability features:
       - Truncated normal initialization (sigma=config.init_std)
@@ -109,7 +108,7 @@ class SLMModel(nn.Module):
     def __init__(self, config: SLMConfig):
         super().__init__()
         self.config = config
-        self.embed = TokenSuperpositionEmbedding(config)
+        self.embed = Embedding(config)
         self.layers = nn.ModuleList([
             TransformerBlock(config, i) for i in range(config.num_hidden_layers)
         ])
@@ -130,10 +129,12 @@ class SLMModel(nn.Module):
         else:
             self.register_buffer("logit_scale", torch.tensor(base_scale))
 
-        self.mtp = MTPModule(config, self.lm_head, self.embed)
-
         # Apply weight initialization AFTER all modules are created
         self.apply(self._init_weights)
+
+        # MTP module (uses shared embedding + lm_head)
+        from models.mtp import MTPModule
+        self.mtp = MTPModule(config, self.lm_head, shared_emb=self.embed)
 
     def _init_weights(self, module):
         """DeepSeek-V3 style truncated normal initialization.
@@ -160,9 +161,9 @@ class SLMModel(nn.Module):
                 module.down_proj.weight.mul_(residual_scale)
 
     def forward(self, input_ids, freqs_cis=None, cos_cache=None, sin_cache=None,
-                use_mtp: bool = True, return_hidden_states: bool = False,
-                tst_group_size: int | None = None, target_ids: torch.Tensor | None = None):
-        x = self.embed(input_ids, group_size_override=tst_group_size)
+                return_hidden_states: bool = False, use_mtp: bool = True,
+                target_ids=None):
+        x = self.embed(input_ids)
 
         # Pre-allocate fixed-size delta buffer to avoid torch.compile recompilation
         # Shape: (max_delta_history, batch_size, seq_len, hidden_size)
@@ -198,11 +199,10 @@ class SLMModel(nn.Module):
 
         x = self.norm(x)
 
-        # Apply config-level MTP toggle if either the flag or the config is False
-        use_mtp = use_mtp and self.config.use_mtp
-
-        # Training: return hidden states for fused CE (avoids materializing logits)
-        # Inference: return logits directly
+        # Training: return hidden states for MTP + fused CE (avoids materializing logits)
+        # Inference: return logits via MTP module
         if return_hidden_states:
             return self.mtp.forward_hidden(x, use_mtp=use_mtp, logit_scale=self.logit_scale, target_ids=target_ids)
-        return self.mtp(x, use_mtp=use_mtp, logit_scale=self.logit_scale)
+
+        logits_list = self.mtp(x, use_mtp=use_mtp, logit_scale=self.logit_scale)
+        return logits_list

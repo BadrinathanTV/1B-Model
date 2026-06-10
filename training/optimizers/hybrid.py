@@ -16,11 +16,9 @@ class HybridSLMOptimizer(torch.optim.Optimizer):
     """Hybrid optimizer: Aurora for 2D weights, 4-bit AdamW for 1D/embeddings."""
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.95), eps=1e-10,
-                 weight_decay=0.1, momentum=0.95, use_riemannian=True,
-                 warmup_steps=2000):
+                 weight_decay=0.1, momentum=0.95, use_riemannian=True):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-                        momentum=momentum, use_riemannian=use_riemannian,
-                        warmup_steps=warmup_steps, k=0)
+                        momentum=momentum, use_riemannian=use_riemannian)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -31,10 +29,7 @@ class HybridSLMOptimizer(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            k = group.get("k", 0)
-            warmup = group.get("warmup_steps", 2000)
-            sched = min(1.0, (k + 1) / warmup) if warmup > 0 else 1.0
-            lr = group["lr"] * sched
+            lr = group["lr"]
 
             for p in group["params"]:
                 if p.grad is None:
@@ -44,7 +39,6 @@ class HybridSLMOptimizer(torch.optim.Optimizer):
                 else:
                     self._step_adamw_4bit(p, group, lr)
 
-            group["k"] = k + 1
         return loss
 
     def _step_aurora(self, p, group, lr):
@@ -52,10 +46,18 @@ class HybridSLMOptimizer(torch.optim.Optimizer):
         state = self.state[p]
         if len(state) == 0:
             state["momentum_buffer"] = torch.zeros_like(p)
-        step_fn = riemannian_aurora if group["use_riemannian"] else aurora
-        step_fn(p.data, p.grad.data, state["momentum_buffer"],
-                eta=lr, weight_decay=group["weight_decay"],
-                mu=group["momentum"])
+        kwargs = {
+            "eta": lr,
+            "weight_decay": group["weight_decay"],
+            "mu": group["momentum"],
+            "update_clip": group.get("update_clip", 0.0)
+        }
+        step_fn = riemannian_aurora if group.get("use_riemannian", True) else aurora
+        if not group.get("use_riemannian", True):
+            kwargs["pp_iterations"] = group.get("pp_iterations", 2)
+            kwargs["pp_beta"] = group.get("pp_beta", 0.5)
+            
+        step_fn(p.data, p.grad.data, state["momentum_buffer"], **kwargs)
 
     def _step_adamw_4bit(self, p, group, lr):
         """Apply 4-bit quantized AdamW update to a 1D/embedding parameter.

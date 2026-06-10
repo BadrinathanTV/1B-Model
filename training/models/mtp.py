@@ -74,12 +74,6 @@ class MTPModule(nn.Module):
                 embs = embs * scale_val
         else:
             embs = self.shared_emb(ids)
-            
-        if ids.dim() == 3:
-            # TST superposition phase: ids is (B, S, s) -> embs is (B, S, s, H). Average over the group dimension.
-            orig_dtype = embs.dtype
-            embs = embs.float().mean(dim=2).to(orig_dtype)
-            
         return embs
 
     def forward(self, hidden_states, use_mtp: bool = True, logit_scale = 1.0):

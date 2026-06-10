@@ -100,7 +100,7 @@ class TestSLMStabilitySuite(unittest.TestCase):
     def test_mtp_variance_stability(self):
         """
         Stacked projections in multi-token prediction models risk variance explosion or collapse.
-        This test proves that our MTPProjection SwiGLU gating + RMSNorm structure stabilizes 
+        This test proves that our MTP SwiGLU gating + RMSNorm structure stabilizes 
         activations, preserving output variance near O(1) regardless of network depth.
         """
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -109,7 +109,7 @@ class TestSLMStabilitySuite(unittest.TestCase):
         # Instantiate standard proper MTP head
         mtp_proper = DeepSeekMTPBlock(self.config).to(device)
         
-        # Instantiate a degraded linear MTP projection head without SwiGLU / RMSNorm/ Residual 
+        # Instantiate a degraded linear MTP projection head without SwiGLU / RMSNorm / Residual 
         class DegradedMTPProjection(nn.Module):
             def __init__(self, hidden_size):
                 super().__init__()
@@ -139,7 +139,6 @@ class TestSLMStabilitySuite(unittest.TestCase):
         
         # Proper stacked MTP heads should be stable and not collapse to 0 or explode to infinity
         self.assertTrue(0.1 < proper_variance < 10.0, f"MTP projection variance exploded or collapsed: {proper_variance}")
-        # Note: degraded stack will either shrink or grow randomly based on initialization scales
 
     def test_delta_residual_convex_bound(self):
         """
@@ -149,17 +148,27 @@ class TestSLMStabilitySuite(unittest.TestCase):
         output scale to the scale of individual deltas, rather than accumulating them linearly.
         """
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.config.num_hidden_layers = 6
+        self.config.max_delta_history = 0
+        max_hist = 2 * self.config.num_hidden_layers
         x = torch.randn(self.batch_size, self.seq_len, self.config.hidden_size, device=device)
         routing_layer = DeltaAttentionResidual(self.config).to(device)
         
         # Learned routing query
         routing_q = nn.Parameter(torch.randn(self.config.hidden_size, device=device))
         
-        # Simulate 10 deltas, each with stable unit variance
-        deltas = [torch.randn(self.batch_size, self.seq_len, self.config.hidden_size, device=device) for _ in range(10)]
+        # Simulate 10 deltas, each with stable unit variance (cap at max_hist)
+        n_deltas = min(10, max_hist)
+        deltas = [torch.randn(self.batch_size, self.seq_len, self.config.hidden_size, device=device) for _ in range(n_deltas)]
+        
+        # Build buffer
+        buf = torch.zeros(max_hist, self.batch_size, self.seq_len, self.config.hidden_size, device=device)
+        for i, d in enumerate(deltas):
+            buf[i] = d
+        num_deltas = torch.tensor([n_deltas], dtype=torch.long, device=device)
         
         # Route through DeltaAttentionResidual
-        routed_x = routing_layer(x, deltas, routing_q)
+        routed_x = routing_layer.forward_static(x, buf, num_deltas, routing_q)
         
         # Calculate routed delta contribution: routed_x - x
         routed_contribution = routed_x - x

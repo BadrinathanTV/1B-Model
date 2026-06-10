@@ -17,10 +17,6 @@ model:
   v_head_dim: 128
   rope_theta: 10000.0
 
-  # TST
-  tst_group_size: 4
-  tst_superposition_ratio: 0.2
-
   # MTP
   mtp_depth: 2
   use_mtp: true
@@ -39,7 +35,7 @@ model:
   gradient_checkpointing_interval: 1
 
 optimizer:
-  type: "sf_normuon"
+  type: "hybrid"
   base_lr: 1.0
   warmup_steps: 10
 
@@ -54,12 +50,9 @@ optimizer:
 
 training:
   batch_size: 16
-  gradient_accumulation_steps: 2   # Small for quick testing
+  gradient_accumulation_steps: 2
   seq_len: 1024
-  max_steps: 5                     # Only run 5 steps
-  mtp_loss_weight: 0.3
-  mtp_loss_weight_final: 0.1
-  mtp_anneal_fraction: 0.67
+  max_steps: 5
   gradient_clip: 1.0
   log_interval: 1
   seed: 42

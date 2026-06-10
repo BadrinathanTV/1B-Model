@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """
-Text Generation and MTP Speculative Decoding Script
-==================================================
+Text Generation Script
+======================
 
-Loads a trained model checkpoint and performs text generation using either:
-1. Standard autoregressive decoding (one token at a time).
-2. Multi-Token Prediction (MTP) speculative decoding (predicting and verifying 
-   multiple tokens per forward pass).
-
+Loads a trained model checkpoint and performs autoregressive text generation.
 Includes support for temperature, top-k, and top-p (nucleus) sampling.
 """
 
@@ -74,12 +70,6 @@ def parse_args():
         help="Top-p (nucleus) sampling threshold (1.0 to disable).",
     )
     parser.add_argument(
-        "--use_mtp",
-        type=bool,
-        default=True,
-        help="Enable MTP speculative decoding (if depth > 1).",
-    )
-    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -104,15 +94,10 @@ def set_seed(seed):
 def load_config(config_path):
     with open(config_path, "r") as f:
         cfg_dict = yaml.safe_load(f)
-    # Extract model block
     model_cfg = cfg_dict.get("model", {})
-    # Map any missing fields
     if "training" not in cfg_dict:
         cfg_dict["training"] = {}
     
-    # TST (Token Superposition Training) is a training-only optimization that averages
-    # consecutive token embeddings. During inference, we always set tst_group_size=1
-    # so the model processes tokens individually for autoregressive generation.
     return SLMConfig(
         vocab_size=model_cfg.get("vocab_size", 128256),
         hidden_size=model_cfg.get("hidden_size", 1280),
@@ -126,8 +111,7 @@ def load_config(config_path):
         qk_rope_head_dim=model_cfg.get("qk_rope_head_dim", 64),
         v_head_dim=model_cfg.get("v_head_dim", 128),
         rope_theta=model_cfg.get("rope_theta", 10000.0),
-        tst_group_size=1,  # ALWAYS 1 at inference — TST is training-only
-        mtp_depth=model_cfg.get("mtp_depth", 2),
+        mtp_depth=model_cfg.get("mtp_depth", 1),
         use_mtp=model_cfg.get("use_mtp", True),
         init_std=model_cfg.get("init_std", 0.02),
         z_loss_weight=float(model_cfg.get("z_loss_weight", 1e-4)),
@@ -191,7 +175,6 @@ def generate_autoregressive(model, prompt_tokens, max_new_tokens, config, tokeni
             c_cache = cos_cache[:curr_len]
             s_cache = sin_cache[:curr_len]
             
-            # Forward call with MTP disabled for standard generation
             logits_list = model(
                 input_ids,
                 freqs_cis=f_cis,
@@ -213,123 +196,6 @@ def generate_autoregressive(model, prompt_tokens, max_new_tokens, config, tokeni
     return generated
 
 
-def generate_speculative(model, prompt_tokens, max_new_tokens, config, tokenizer, temperature, top_k, top_p):
-    """MTP Speculative Decoding."""
-    device = next(model.parameters()).device
-    model.eval()
-
-    # Precompute caches up to the maximum potential length
-    max_seq_len = len(prompt_tokens) + max_new_tokens + 10
-    freqs_cis = precompute_freqs_cis(config.qk_rope_head_dim, max_seq_len, config.rope_theta, device)
-    cos_cache, sin_cache = precompute_cos_sin(config.qk_rope_head_dim, max_seq_len, config.rope_theta, device)
-
-    generated = list(prompt_tokens)
-    print(tokenizer.decode(generated), end="", flush=True)
-
-    start_time = time.time()
-    steps = 0
-    tokens_generated = 0
-    accepted_draft_tokens = 0
-
-    while tokens_generated < max_new_tokens:
-        curr_len = len(generated)
-        input_ids = torch.tensor([generated], dtype=torch.long, device=device)
-
-        # 1. Forward pass on current prefix
-        with torch.no_grad():
-            f_cis = freqs_cis[:curr_len]
-            c_cache = cos_cache[:curr_len]
-            s_cache = sin_cache[:curr_len]
-            
-            logits_list = model(
-                input_ids,
-                freqs_cis=f_cis,
-                cos_cache=c_cache,
-                sin_cache=s_cache,
-                use_mtp=True,
-            )
-
-        # Sample the next token x_{t+1} from the main head
-        next_token_logits = logits_list[0][0, -1, :]
-        next_token = sample(next_token_logits, temperature, top_k, top_p)
-        generated.append(next_token)
-        print(tokenizer.decode([next_token]), end="", flush=True)
-        tokens_generated += 1
-        steps += 1
-
-        if tokens_generated >= max_new_tokens:
-            break
-
-        # 2. Propose draft token if MTP head exists and config allows MTP
-        if len(logits_list) > 1 and config.mtp_depth > 1:
-            draft_logits = logits_list[1][0, -1, :]
-            draft_token = sample(draft_logits, temperature, top_k, top_p)
-
-            # 3. Verify draft token by doing a parallel forward pass on (prefix + next_token + draft_token)
-            verify_input_ids = torch.tensor([generated + [draft_token]], dtype=torch.long, device=device)
-            verify_len = len(generated) + 1
-
-            with torch.no_grad():
-                vf_cis = freqs_cis[:verify_len]
-                vc_cache = cos_cache[:verify_len]
-                vs_cache = sin_cache[:verify_len]
-
-                verify_logits_list = model(
-                    verify_input_ids,
-                    freqs_cis=vf_cis,
-                    cos_cache=vc_cache,
-                    sin_cache=vs_cache,
-                    use_mtp=True,
-                )
-
-            # verify logits corresponding to next_token predicts draft_token
-            target_logits = verify_logits_list[0][0, -2, :]
-            best_target_token = torch.argmax(target_logits).item()
-
-            # Decide validation stochastically or greedily
-            accepted = False
-            if temperature == 0.0:
-                accepted = (draft_token == best_target_token)
-            else:
-                target_probs = F.softmax(target_logits / temperature, dim=-1)
-                draft_probs = F.softmax(draft_logits / temperature, dim=-1)
-                p_val = target_probs[draft_token].item()
-                q_val = draft_probs[draft_token].item()
-
-                accept_prob = min(1.0, p_val / max(q_val, 1e-12))
-                accepted = (random.random() < accept_prob)
-
-            if accepted:
-                # Accept draft token!
-                generated.append(draft_token)
-                print(tokenizer.decode([draft_token]), end="", flush=True)
-                tokens_generated += 1
-                accepted_draft_tokens += 1
-
-                # 4. Grab bonus prediction token from position of accepted draft token
-                if tokens_generated < max_new_tokens:
-                    next_next_logits = verify_logits_list[0][0, -1, :]
-                    next_next_token = sample(next_next_logits, temperature, top_k, top_p)
-                    generated.append(next_next_token)
-                    print(tokenizer.decode([next_next_token]), end="", flush=True)
-                    tokens_generated += 1
-            else:
-                # Rejected — discard draft token
-                pass
-
-    elapsed = time.time() - start_time
-    print("\n" + "=" * 50)
-    print("MTP Speculative Decoding Complete:")
-    print(f"  Total tokens generated:      {tokens_generated}")
-    print(f"  Total forward pass steps:    {steps}")
-    print(f"  MTP draft tokens accepted:   {accepted_draft_tokens}")
-    print(f"  Verification acceptance rate: {accepted_draft_tokens / steps * 100:.1f}%")
-    print(f"  Theoretical speedup:         {tokens_generated / steps:.2f}x")
-    print(f"  Generation speed:            {tokens_generated / elapsed:.2f} tokens/sec")
-    print("=" * 50)
-    return generated
-
-
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -337,7 +203,7 @@ def main():
     print(f"Loading config from {args.config}...")
     config = load_config(args.config)
     print(f"Model dimensions: Hidden: {config.hidden_size}, Layers: {config.num_hidden_layers}, Attention Heads: {config.num_attention_heads}")
-    print(f"MTP configurations: Depth = {config.mtp_depth}, Config use_mtp = {config.use_mtp}")
+    print(f"MTP: Depth = {config.mtp_depth}")
     print(f"Output Logit Scaling / Temp Scale: {config.output_logit_scale} (Trainable: {config.output_logit_scale_trainable})")
 
     # Load tokenizer
@@ -380,34 +246,17 @@ def main():
     prompt_tokens = tokenizer.encode(prompt)
     print(f"Encoded prompt: {prompt_tokens} (Length: {len(prompt_tokens)})")
 
-    # Select generation mode
-    # Only allow speculative if mtp_depth > 1 and use_mtp is requested/enabled
-    do_speculative = args.use_mtp and config.use_mtp and config.mtp_depth > 1
-
-    if do_speculative:
-        print("Starting MTP Speculative Decoding...")
-        generate_speculative(
-            model=model,
-            prompt_tokens=prompt_tokens,
-            max_new_tokens=args.max_new_tokens,
-            config=config,
-            tokenizer=tokenizer,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-        )
-    else:
-        print("Starting standard autoregressive decoding...")
-        generate_autoregressive(
-            model=model,
-            prompt_tokens=prompt_tokens,
-            max_new_tokens=args.max_new_tokens,
-            config=config,
-            tokenizer=tokenizer,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-        )
+    print("Starting standard autoregressive decoding...")
+    generate_autoregressive(
+        model=model,
+        prompt_tokens=prompt_tokens,
+        max_new_tokens=args.max_new_tokens,
+        config=config,
+        tokenizer=tokenizer,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+    )
 
 
 if __name__ == "__main__":

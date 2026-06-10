@@ -7,8 +7,6 @@ falls back to PyTorch complex arithmetic otherwise.
 """
 
 import torch
-import math
-
 try:
     from liger_kernel.ops.rope import LigerRopeFunction
     LIGER_ROPE = True

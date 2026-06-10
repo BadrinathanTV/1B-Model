@@ -9,12 +9,12 @@ from optimizers.factory import build_optimizer
 from config import SLMConfig
 
 class DummyModel(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, device='cpu'):
         super().__init__()
         # 1D parameter for AdamW/fallback group
-        self.w1 = torch.nn.Parameter(torch.tensor([2.0], device='cuda'))
+        self.w1 = torch.nn.Parameter(torch.tensor([2.0], device=device))
         # 2D parameter for Aurora/Spectral group
-        self.w2 = torch.nn.Parameter(torch.tensor([[2.0]], device='cuda'))
+        self.w2 = torch.nn.Parameter(torch.tensor([[2.0]], device=device))
         
     def forward(self, x):
         return self.w1 * x + self.w2 @ x
@@ -22,14 +22,13 @@ class DummyModel(torch.nn.Module):
 class TestOptimizers(unittest.TestCase):
     def setUp(self):
         self.config = SLMConfig()
-        # Ensure we have some basic optimizer settings
-        self.config.optimizer.learning_rate = 0.1
-        self.config.optimizer.weight_decay = 0.0
+        self.config.optimizer.base_lr = 0.1
         self.config.optimizer.warmup_steps = 0
 
     def check_optimizer_convergence(self, opt_type):
         self.config.optimizer.type = opt_type
-        model = DummyModel()
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        model = DummyModel(device=device)
         
         try:
             optimizer = build_optimizer(model, self.config)
@@ -56,20 +55,11 @@ class TestOptimizers(unittest.TestCase):
         self.assertTrue(abs(model.w1.item()) < 2.0, f"{opt_type} 1D weight failed to converge. Final w1={model.w1.item()}")
         self.assertTrue(abs(model.w2.item()) < 2.0, f"{opt_type} 2D weight failed to converge. Final w2={model.w2.item()}")
 
-    def test_nf_aurora(self):
-        self.check_optimizer_convergence("nf_aurora")
+    def test_hybrid(self):
+        self.check_optimizer_convergence("hybrid")
 
-    def test_nf_aurora_hybrid(self):
-        self.check_optimizer_convergence("nf_aurora_hybrid")
-
-    def test_sf_normuon(self):
-        self.check_optimizer_convergence("sf_normuon")
-
-    def test_nf_normuon_hybrid(self):
-        self.check_optimizer_convergence("nf_normuon_hybrid")
-        
-    def test_polar(self):
-        self.check_optimizer_convergence("polar")
+    def test_adamw(self):
+        self.check_optimizer_convergence("adamw")
 
 if __name__ == '__main__':
     unittest.main()

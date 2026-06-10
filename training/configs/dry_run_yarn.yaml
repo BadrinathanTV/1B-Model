@@ -23,7 +23,6 @@ model:
   yarn_beta_fast: 32.0
   yarn_beta_slow: 1.0
 
-  tst_group_size: 4
   mtp_depth: 1
   use_mtp: true
 
@@ -40,7 +39,7 @@ model:
   gradient_checkpointing: false
 
 optimizer:
-  type: "sf_normuon"
+  type: "hybrid"
   base_lr: 1.0 
   warmup_steps: 50
 
@@ -58,9 +57,6 @@ training:
   gradient_accumulation_steps: 1
   seq_len: 1024 
   max_steps: 10
-  mtp_loss_weight: 0.3
-  mtp_loss_weight_final: 0.1
-  mtp_anneal_fraction: 0.67
   gradient_clip: 1.0
   log_interval: 1
   seed: 42

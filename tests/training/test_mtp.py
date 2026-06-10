@@ -85,7 +85,7 @@ class TestMTPModule(unittest.TestCase):
         targets = torch.randint(0, self.config.vocab_size, (batch_size, seq_len))
         
         # Should compute loss successfully without shape crashes
-        loss, _ = compute_loss(hidden_states_list, targets, self.lm_head.weight, self.config, 0)
+        loss, _ = compute_loss(hidden_states_list, targets, self.lm_head.weight, self.config)
         self.assertTrue(loss.item() > 0)
 
     def test_loss_computation_mtp_disabled(self):
@@ -98,7 +98,7 @@ class TestMTPModule(unittest.TestCase):
         targets = torch.randint(0, self.config.vocab_size, (batch_size, seq_len))
         
         # Should compute loss successfully even if MTP is disabled (only main logits used)
-        loss, _ = compute_loss(hidden_states_list, targets, self.lm_head.weight, self.config, 0)
+        loss, _ = compute_loss(hidden_states_list, targets, self.lm_head.weight, self.config)
         self.assertTrue(loss.item() > 0)
 
 class TestMTPIntegration(unittest.TestCase):
@@ -110,7 +110,6 @@ class TestMTPIntegration(unittest.TestCase):
         config.hidden_size = 64
         config.num_hidden_layers = 2
         config.num_attention_heads = 2
-        config.tst_group_size = 1 # Disable TST to isolate MTP
         config.mtp_depth = 3
         config.training.seq_len = 8
         config.max_delta_history = 0
@@ -128,7 +127,7 @@ class TestMTPIntegration(unittest.TestCase):
         # Case 1: MTP enabled end-to-end
         hidden_states_mtp = model(inputs, freqs_cis=freqs_cis, cos_cache=cos_cache, sin_cache=sin_cache, use_mtp=True, return_hidden_states=True)
         self.assertEqual(len(hidden_states_mtp), 3)
-        loss_mtp, _ = compute_loss(hidden_states_mtp, targets, model.lm_head.weight, config, 0)
+        loss_mtp, _ = compute_loss(hidden_states_mtp, targets, model.lm_head.weight, config)
         loss_mtp.backward()
         self.assertIsNotNone(model.embed.word_embeddings.weight.grad)
         
@@ -138,43 +137,8 @@ class TestMTPIntegration(unittest.TestCase):
         # Case 2: MTP disabled end-to-end
         hidden_states_nomtp = model(inputs, freqs_cis=freqs_cis, cos_cache=cos_cache, sin_cache=sin_cache, use_mtp=False, return_hidden_states=True)
         self.assertEqual(len(hidden_states_nomtp), 1)
-        loss_nomtp, _ = compute_loss(hidden_states_nomtp, targets, model.lm_head.weight, config, 0)
+        loss_nomtp, _ = compute_loss(hidden_states_nomtp, targets, model.lm_head.weight, config)
         loss_nomtp.backward()
-        self.assertIsNotNone(model.embed.word_embeddings.weight.grad)
-
-    def test_full_model_mtp_and_tst_superposition(self):
-        from layers.rope import precompute_freqs_cis, precompute_cos_sin
-        
-        config = SLMConfig()
-        config.vocab_size = 100
-        config.hidden_size = 64
-        config.num_hidden_layers = 2
-        config.num_attention_heads = 2
-        config.tst_group_size = 2 # Enable TST
-        config.mtp_depth = 3
-        config.training.seq_len = 8
-        config.max_delta_history = 0
-        
-        model = SLMModel(config)
-        model.train()
-        
-        batch_size = 2
-        # TST inputs/targets are (batch_size, seq_len, tst_group_size)
-        inputs = torch.randint(0, config.vocab_size, (batch_size, config.training.seq_len, config.tst_group_size))
-        targets = torch.randint(0, config.vocab_size, (batch_size, config.training.seq_len, config.tst_group_size))
-        
-        freqs_cis = precompute_freqs_cis(config.qk_rope_head_dim, config.training.seq_len, config.rope_theta, inputs.device)
-        cos_cache, sin_cache = precompute_cos_sin(config.qk_rope_head_dim, config.training.seq_len, config.rope_theta, inputs.device)
-        
-        # MTP and TST enabled end-to-end
-        hidden_states_list = model(
-            inputs, freqs_cis=freqs_cis, cos_cache=cos_cache, sin_cache=sin_cache,
-            use_mtp=True, return_hidden_states=True, target_ids=targets
-        )
-        self.assertEqual(len(hidden_states_list), 3)
-        
-        loss, _ = compute_loss(hidden_states_list, targets, model.lm_head.weight, config, 0, is_superposition=True)
-        loss.backward()
         self.assertIsNotNone(model.embed.word_embeddings.weight.grad)
 
 if __name__ == '__main__':
