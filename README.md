@@ -132,26 +132,37 @@ Parameters are routed automatically based on their dimension:
 YAML configurations define both structural settings and optimizer choices:
 ```yaml
 model:
-  vocab_size: 64000
-  hidden_size: 1536
+  vocab_size: 65536
+  hidden_size: 1280
   num_hidden_layers: 24
-  num_attention_heads: 12
-  intermediate_size: 4096
-  max_position_embeddings: 4096
-  tst_group_size: 2
+  num_attention_heads: 10
+  intermediate_size: 5120
+  max_position_embeddings: 8192
   mtp_depth: 2
 
 optimizer:
   type: "hybrid" # Options: "hybrid", "nf_aurora", "sf_normuon", "adamw"
-  base_lr: 1.0e-3
+  base_lr: 4.0e-2
   warmup_steps: 2000
 
 training:
-  batch_size: 2
-  seq_len: 512
-  max_steps: 10000
-  gradient_accumulation_steps: 8
+  batch_size: 32 # Balanced for 16GB VRAM budget
+  seq_len: 512 # Set for Stage 1 pretraining
+  max_steps: 47684 # 50B tokens total
+  gradient_accumulation_steps: 64 # Effective batch size = 2048 (32 * 64)
+  gradient_checkpointing: true # Retained to avoid OOM
 ```
+
+---
+
+## 🔄 Periodic Curriculum (Interleaved MTP Training)
+
+To optimize pretraining throughput on standard consumer GPUs (such as the RTX 5080 16GB) while keeping speculative prediction heads synchronized, the pipeline runs an interleaved periodic curriculum relative to your checkpoint interval (e.g., `--checkpoint_interval 500`):
+
+1. **Base Phase (First 80% / Steps 0-399):** Multi-Token Prediction (MTP) is bypassed in the forward/backward passes. This speeds up base-model pretraining by bypassing 2 out of the 3 heavy `lm_head` projections.
+2. **MTP Phase (Last 20% / Steps 400-499):** MTP heads are automatically turned ON so they learn in lockstep with the base model representation before the checkpoint is written.
+3. **Seamless Iterators:** Toggling happens dynamically in the training loop without recreating the DataLoader, preventing random sampler resets and guaranteeing perfect 1-epoch traversal over the pretraining corpus.
+
 
 ---
 
@@ -178,8 +189,8 @@ Or run steps individually:
 # 1. Download and build the AST-FIM pretraining corpus
 python scripts/build_pretraining_corpus.py
 
-# 2. Launch the main BF16 Accelerate-based training loop
-python training/train.py --config training/configs/default.yaml
+# 2. Launch the main BF16 Accelerate-based training loop with full end-to-end compile
+uv run python training/train.py --config training/configs/default.yaml --compile --checkpoint_interval 500
 ```
 
 ### 3. Running Verification Tests & Benchmarks
