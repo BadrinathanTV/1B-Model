@@ -5,21 +5,21 @@ RMSNorm Layer
 Provides TritonRMSNorm (fused, fast) with automatic PyTorch fallback.
 """
 
-try:
-    from optimizers.kernels.rms_norm import TritonRMSNorm as RMSNorm
-except ImportError:
-    # Fallback: pure PyTorch RMSNorm
-    import torch
-    import torch.nn as nn
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-    class RMSNorm(nn.Module):
-        """Root Mean Square Layer Normalization (PyTorch fallback)."""
-        def __init__(self, dim: int, eps: float = 1e-6, use_triton: bool = True):
-            super().__init__()
-            self.eps = eps
-            self.weight = nn.Parameter(torch.ones(dim))
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization.
+    
+    Optimized to use native PyTorch F.rms_norm. 
+    Drops the learned scale (weight) parameter to match modded-nanoGPT, 
+    saving memory bandwidth and parameters with identical performance.
+    """
+    def __init__(self, dim: int, eps: float = 1e-6, use_triton: bool = False):
+        super().__init__()
+        self.eps = eps
+        # No learned weight parameter (reduces memory traffic and parameters)
 
-        def forward(self, x):
-            variance = x.float().pow(2).mean(-1, keepdim=True)
-            x_normed = x * torch.rsqrt(variance + self.eps).to(x.dtype)
-            return self.weight * x_normed
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),), weight=None, eps=self.eps)

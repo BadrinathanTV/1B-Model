@@ -43,7 +43,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.q_head_norm = RMSNorm(qk_head_dim, config.rms_norm_eps, use_triton=False)
         self.k_head_norm = RMSNorm(qk_head_dim, config.rms_norm_eps, use_triton=False)
         
-    def forward(self, x, freqs_cis=None, cos_cache=None, sin_cache=None):
+    def forward(self, x, freqs_cis=None, cos_cache=None, sin_cache=None, past_key_value=None):
         batch_size, seq_len, _ = x.shape
         
         # --- Query Path ---
@@ -89,12 +89,28 @@ class MultiHeadLatentAttention(nn.Module):
         # disables FlashAttention and falls back to Math (instant OOM).
         v_padded = F.pad(v, (0, self.qk_rope_head_dim))
         
+        # --- KV Cache Logic ---
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k_full = torch.cat([past_k, k_full], dim=2)
+            v_padded = torch.cat([past_v, v_padded], dim=2)
+        
+        # We only return the updated cache during inference (when past_key_value is passed)
+        present_key_value = (k_full, v_padded) if past_key_value is not None else None
+        
+        # is_causal must be False if we are in decode phase (query length < key length)
+        is_causal = (seq_len > 1 and q_full.size(2) == k_full.size(2))
+        
         # Use cuDNN/Triton optimized SDPA 
-        attn_output = F.scaled_dot_product_attention(q_full, k_full, v_padded, is_causal=True)
+        attn_output = F.scaled_dot_product_attention(q_full, k_full, v_padded, is_causal=is_causal)
         
         # Slice off the padding we just added
         attn_output = attn_output[..., :self.v_head_dim]
         
         # Reshape and project out
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        
+        # If cache was provided, return output + new cache. Otherwise just return output.
+        if past_key_value is not None:
+            return self.o_proj(attn_output), present_key_value
         return self.o_proj(attn_output)

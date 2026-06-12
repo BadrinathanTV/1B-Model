@@ -69,8 +69,12 @@ def _fused_ce_loss(hidden_states, lm_head_weight, targets, z_loss_weight=0.0, re
         return_z_loss
     )
     if return_z_loss:
-        return res[0], res[1]
-    return res[0]
+        # Depending on Liger version, res might be a tuple (loss, z_loss)
+        return res[0] if isinstance(res, tuple) else res, res[1] if isinstance(res, tuple) else torch.tensor(0.0)
+    
+    # If not returning z_loss, safely extract the loss whether it's wrapped in a tuple or not
+    loss_tensor = res[0] if isinstance(res, tuple) else res
+    return loss_tensor
 
 
 def _standard_ce_loss(hidden_states, lm_head_weight, targets, vocab_size):
@@ -137,10 +141,17 @@ def compute_loss(hidden_states_list, targets, lm_head_weight, config: SLMConfig,
                 mtp_targets = targets[:, i:].contiguous()
             if mtp_hs_trimmed.numel() == 0 or mtp_targets.numel() == 0:
                 continue
-            mtp_ce = _standard_ce_loss(mtp_hs_trimmed, lm_head_weight, mtp_targets, config.vocab_size)
+            if use_fused:
+                mtp_ce_res = _fused_ce_loss(mtp_hs_trimmed, lm_head_weight, mtp_targets)
+                # Satisfy static type checkers (Pyright/mypy) that might infer a tuple
+                mtp_ce = mtp_ce_res[0] if isinstance(mtp_ce_res, tuple) else mtp_ce_res
+            else:
+                mtp_ce = _standard_ce_loss(mtp_hs_trimmed, lm_head_weight, mtp_targets, config.vocab_size)
+            
+            # Use type() or isinstance to guarantee it's a tensor for Pyright
             mtp_loss = mtp_loss + mtp_weight * mtp_ce
 
-        total_loss = total_loss + mtp_loss
+        total_loss = total_loss + mtp_loss 
 
     metrics = {
         "main_loss": main_loss.detach(),
@@ -289,9 +300,8 @@ def main():
     t0 = time.time()
     model = SLMModel(config).to(device=accelerator.device, dtype=torch.bfloat16)
     if args.compile:
-        accelerator.print("      Compiling individual TransformerBlocks...", flush=True)
-        for i in range(len(model.layers)):
-            model.layers[i] = torch.compile(model.layers[i])  # type: ignore
+        accelerator.print("      Compiling full model (end-to-end)...", flush=True)
+        model = torch.compile(model)
     param_count = sum(p.numel() for p in model.parameters())
     vram_mb = torch.cuda.memory_allocated() / 1024**2
     accelerator.print(f"      Done in {time.time()-t0:.1f}s — {param_count/1e9:.3f}B params, {vram_mb:.0f} MB VRAM", flush=True)
@@ -417,6 +427,7 @@ def main():
 
     # ── Training loop ──
     grad_accum_steps = getattr(train_cfg, 'gradient_accumulation_steps', 8)
+    
     accelerator.print(
         f"Starting training loop ({train_cfg.max_steps} steps, "
         f"grad_accum={grad_accum_steps}, effective_batch={train_cfg.batch_size * grad_accum_steps})...",
@@ -427,6 +438,17 @@ def main():
     data_iter = iter(dataloader)
 
     for step in range(global_step, train_cfg.max_steps):
+        # Periodic MTP Curriculum: Interleave MTP training within each checkpoint interval
+        interval = args.checkpoint_interval
+        mtp_start_step_in_interval = int(interval * 0.8)
+        is_mtp_phase = (step % interval) >= mtp_start_step_in_interval
+        
+        # Log transition within the interval
+        if (step % interval) == mtp_start_step_in_interval:
+            accelerator.print(f"\n>>> [Step {step}] PERIODIC CURRICULUM: ENTERING MTP PHASE (MTP ON) <<<", flush=True)
+        elif (step % interval) == 0 and step > 0:
+            accelerator.print(f"\n>>> [Step {step}] PERIODIC CURRICULUM: ENTERING BASE PHASE (MTP OFF) <<<", flush=True)
+
         t_step = time.time()
         accum_loss = torch.tensor(0.0, device=accelerator.device)
         accum_metrics = {}
@@ -446,7 +468,7 @@ def main():
                     inputs, freqs_cis=freqs_cis,
                     cos_cache=cos_cache, sin_cache=sin_cache,
                     return_hidden_states=True,
-                    use_mtp=config.use_mtp,
+                    use_mtp=config.use_mtp and is_mtp_phase,
                     target_ids=targets,
                 )
                 loss, metrics = compute_loss(

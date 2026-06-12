@@ -24,6 +24,13 @@ model:
   mtp_depth: 2                   # 1 = standard next-token prediction
   use_mtp: true
 
+  # YaRN Context Extension
+  use_yarn: false
+  yarn_scale_factor: 1.0
+  yarn_original_context: 512     # Match the new 512 pretraining seq_len
+  yarn_beta_fast: 32.0
+  yarn_beta_slow: 1.0
+
   # Stability: Weight Initialization (DeepSeek-V3 uses 0.006; 1/√1280 ≈ 0.028)
   init_std: 0.02
 
@@ -65,10 +72,10 @@ optimizer:
 
 # ─── Training ─────────────────────────────────────────────────────────────────
 training:
-  batch_size: 32 # The PROVEN config that achieved 26k TPS
-  gradient_accumulation_steps: 64  # 32 * 64 = 2048
-  seq_len: 1024
-  max_steps: 5960
+  batch_size: 32 # Safe batch size for 16GB VRAM (allows MTP to be toggled safely)
+  gradient_accumulation_steps: 64  # 32 * 64 = 2048 effective batch size
+  seq_len: 512
+  max_steps: 47684 # 47,684 steps * 2048 bs * 512 seq_len = 50,000,000,000 tokens (50B tokens)
   gradient_clip: 1.0
   log_interval: 1
   seed: 42

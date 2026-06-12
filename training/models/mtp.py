@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from config import SLMConfig
 from layers.norm import RMSNorm
 from layers.ffn import DenseFFN
+from torch.utils.checkpoint import checkpoint
 
 
 class DeepSeekMTPBlock(nn.Module):
@@ -115,7 +116,10 @@ class MTPModule(nn.Module):
                     curr_states = curr_states[:, :-1, :]
                     pred_embs = pred_embs[:, :-1, :]
                     
-                    curr_states = block(curr_states, pred_embs)
+                    if curr_states.requires_grad:
+                        curr_states = checkpoint(block, curr_states, pred_embs, use_reentrant=False)
+                    else:
+                        curr_states = block(curr_states, pred_embs)
                     states_list.append(norm(curr_states) * logit_scale)
             else:
                 # Teacher forcing: target_ids is the sequence of targets.
@@ -127,7 +131,10 @@ class MTPModule(nn.Module):
                     curr_targets = target_embs[:, :-1, :]
                     
                     # Combine latent state (t) with target embedding (t+1) to predict (t+2)
-                    curr_states = block(curr_states, curr_targets)
+                    if curr_states.requires_grad:
+                        curr_states = checkpoint(block, curr_states, curr_targets, use_reentrant=False)
+                    else:
+                        curr_states = block(curr_states, curr_targets)
                     states_list.append(norm(curr_states) * logit_scale)
                     
                     # Since we shrunk the sequence, target_embs must also shrink for the next MTP layer

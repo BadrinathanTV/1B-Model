@@ -2,68 +2,88 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import SLMConfig
-
 class DeltaAttentionResidual(nn.Module):
-    """Delta Attention Residuals routing connection to prevent routing collapse.
-
-    Uses a fixed-size tensor buffer instead of a variable-length Python list
-    to avoid torch.compile recompilation on every unique delta count.
-    """
-    def __init__(self, config: SLMConfig):
+    def __init__(self, config):
         super().__init__()
         self.config = config
+        self.hidden_size = config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
 
-    def forward_static(self, x, deltas_buf, num_deltas, routing_q):
-        """Compile-friendly branchless routing over a fixed-size delta buffer.
-
-        Mathematically identical to forward(), but operates on a pre-allocated
-        tensor buffer with a mask instead of a variable-length Python list.
-        This avoids torch.compile recompilations caused by changing list lengths.
-
-        Args:
-            x: Current hidden state (batch, seq_len, hidden_size)
-            deltas_buf: Fixed-size buffer (max_hist, batch, seq_len, hidden_size)
-            num_deltas: Number of active slots (scalar tensor on device)
-            routing_q: Learned query parameter (hidden_size,)
-
-        Returns:
-            x + weighted sum of active deltas
-        """
-        max_hist = deltas_buf.shape[0]
-
-        # RMSNorm (stateless): normalize ALL slots (inactive slots are zeros,
-        # their scores will be masked to -inf anyway)
-        nf = torch.mean(deltas_buf.float() ** 2, dim=-1, keepdim=True)
-        nd = deltas_buf * torch.rsqrt(nf + self.rms_norm_eps).to(deltas_buf.dtype)
-
-        # Score each slot: dot product with routing query → (max_hist, B, S)
-        scores = torch.sum(nd * routing_q, dim=-1)
-
-        # Boolean mask for active slots: shape (max_hist, 1, 1)
-        indices = torch.arange(max_hist, device=deltas_buf.device)
-        mask = (indices < num_deltas).view(-1, 1, 1)
-
-        # FIX 1 & 3: Bypass the -inf mask ONLY if the buffer is completely empty.
-        # This prevents F.softmax from receiving an all '-inf' tensor and outputting NaN.
-        # The output will safely be zeroed out in the next step anyway.
-        safe_mask = mask | (num_deltas == 0)
+    def init_state(self, batch_size: int, seq_len: int, max_deltas: int, dtype: torch.dtype, device: torch.device):
+        """Allocates static-sized buffers for the generation phase."""
+        # [max_deltas, B, S, H]
+        delta_buffer = torch.zeros((max_deltas, batch_size, seq_len, self.hidden_size), 
+                                   dtype=dtype, device=device)
+        # [max_deltas, B, S]
+        active_mask = torch.zeros((max_deltas, batch_size, seq_len), 
+                                  dtype=torch.bool, device=device)
+        # 0D tensor to track insertions on-device without graph breaks
+        current_idx = torch.tensor(0, dtype=torch.long, device=device)
         
-        # Use exact float('-inf') to ensure active slots always sum strictly to 1.0
-        masked_scores = torch.where(
-            safe_mask, 
-            scores, 
-            torch.tensor(float('-inf'), device=scores.device, dtype=scores.dtype)
-        )
+        return delta_buffer, active_mask, current_idx
 
-        # Softmax across delta dimension (dim=0) → (max_hist, B, S)
-        alpha = F.softmax(masked_scores, dim=0)
+    def update_state(self, new_delta: torch.Tensor, delta_buffer: torch.Tensor, active_mask: torch.Tensor, current_idx: torch.Tensor):
+        """Inserts a new delta using a ring buffer to cap memory."""
+        max_deltas = delta_buffer.size(0)
+        idx = current_idx % max_deltas  # Overwrite oldest when full
+        
+        # In-place updates maintain static shapes for the compiler
+        delta_buffer[idx] = new_delta
+        active_mask[idx] = True
+        
+        return delta_buffer, active_mask, current_idx + 1
 
-        # FIX 2: Cast mask to alpha's dtype to prevent silent upcasting to float32
-        alpha = alpha * mask.to(alpha.dtype)
+    def forward(self, x: torch.Tensor, routing_q: torch.Tensor, past_deltas=None, delta_buffer=None, active_mask=None):
+        """Dual-phase forward pass: lists for training, static buffers for compiled generation."""
+        # ---------------------------------------------------------
+        # PHASE 1: Training (List-based, dynamic)
+        # ---------------------------------------------------------
+        if past_deltas is not None:
+            if not past_deltas:
+                return x
+            
+            deltas_stack = torch.stack(past_deltas, dim=0)
+            num_deltas, B, S, H = deltas_stack.shape
+            
+            # RMSNorm (stateless)
+            nd = F.rms_norm(deltas_stack, (H,), weight=None, eps=self.rms_norm_eps)
 
-        # Weighted sum across all slots → (B, S, H)
-        routed = torch.sum(alpha.unsqueeze(-1) * deltas_buf, dim=0)
+            # Score each slot: use flattened F.linear to avoid einsum broadcast OOM
+            nd_flat = nd.view(-1, H)
+            scores_flat = F.linear(nd_flat, routing_q)
+            scores = scores_flat.view(num_deltas, B, S)
 
-        return x + routed
+            alpha = F.softmax(scores, dim=0)
+
+            # Route via batched matrix multiply (bmm) to avoid einsum OOM
+            alpha_flat = alpha.permute(1, 2, 0).reshape(-1, 1, num_deltas)
+            deltas_flat = deltas_stack.permute(1, 2, 0, 3).reshape(-1, num_deltas, H)
+            routed = torch.bmm(alpha_flat, deltas_flat).view(B, S, H)
+
+            return x + routed
+
+        # ---------------------------------------------------------
+        # PHASE 2: Generation (Static buffers, compiled-ready)
+        # ---------------------------------------------------------
+        assert delta_buffer is not None and active_mask is not None, "Must provide delta_buffer and active_mask if use_cache=True"
+        
+        # 1. Normalize the entire static buffer
+        nd = F.rms_norm(delta_buffer, (self.hidden_size,), weight=None, eps=self.rms_norm_eps)
+
+        # 2. Compute scores directly via einsum (safe during generation as B=1 usually)
+        scores = torch.einsum('nbsh, h -> nbs', nd, routing_q)
+
+        # 3. Mask out uninitialized slots with -inf
+        scores = scores.masked_fill(~active_mask, float('-inf'))
+
+        # 4. Softmax
+        alpha = F.softmax(scores, dim=0)
+
+        # 5. Route via weighted sum
+        routed = torch.einsum('nbs, nbsh -> bsh', alpha, delta_buffer)
+
+        # 6. The NaN Safeguard
+        has_active = active_mask.any(dim=0).unsqueeze(-1)  # (B, S, 1)
+        routed = torch.nan_to_num(routed, nan=0.0)
+
+        return torch.where(has_active, x + routed, x)
