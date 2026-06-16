@@ -229,7 +229,7 @@ def main():
     print(f"Output Logit Scaling / Temp Scale: {config.output_logit_scale} (Trainable: {config.output_logit_scale_trainable})")
 
     # Load tokenizer
-    tokenizer_path = "models/tokenizer"
+    tokenizer_path = "models/tokenizer_bpe_65528_agentic_reasoning"
     if not os.path.exists(tokenizer_path):
         print(f"Error: Tokenizer directory '{tokenizer_path}' does not exist.")
         sys.exit(1)

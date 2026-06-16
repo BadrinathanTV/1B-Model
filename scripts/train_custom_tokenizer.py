@@ -127,8 +127,9 @@ def train_tokenizer():
     tokenizer.train_from_iterator(batched_gen, trainer=trainer)
     
     # Save results
-    os.makedirs("models/tokenizer", exist_ok=True)
-    tokenizer.save("models/tokenizer/tokenizer.json")
+    output_dir = "models/tokenizer_bpe_65528_agentic_reasoning"
+    os.makedirs(output_dir, exist_ok=True)
+    tokenizer.save(os.path.join(output_dir, "tokenizer.json"))
     
     raw_vocab_size = tokenizer.get_vocab_size()
     print(f"\n✅ Raw BPE tokenizer trained. Vocab size: {raw_vocab_size} (max ID: {raw_vocab_size - 1})")
@@ -162,8 +163,8 @@ def train_tokenizer():
             if tid:
                 print(f"   {tok_str} -> ID {tid[0]}")
         
-        fast_tokenizer.save_pretrained("models/tokenizer")
-        print(f"✅ Tokenizer saved to models/tokenizer/ (total vocab: {wrapped_vocab_size}, max ID: {wrapped_vocab_size - 1})")
+        fast_tokenizer.save_pretrained(output_dir)
+        print(f"✅ Tokenizer saved to {output_dir}/ (total vocab: {wrapped_vocab_size}, max ID: {wrapped_vocab_size - 1})")
     except ImportError:
         print("Note: 'transformers' library not installed, skipping HuggingFace format export.")
 

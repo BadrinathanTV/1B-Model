@@ -20,8 +20,8 @@ model:
   mtp_depth: 2
   use_mtp: true
 
-  use_yarn: false
-  yarn_scale_factor: 1.0
+  use_yarn: true
+  yarn_scale_factor: 4.0
   yarn_original_context: 512
   yarn_beta_fast: 32.0
   yarn_beta_slow: 1.0
@@ -41,8 +41,8 @@ model:
 
 optimizer:
   type: "hybrid"
-  base_lr: 0.04
-  warmup_steps: 1000
+  base_lr: 0.004
+  warmup_steps: 100
 
   aurora:
     momentum: 0.95

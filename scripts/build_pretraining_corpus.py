@@ -1,61 +1,38 @@
 import os
-import glob
-import gzip
-import json
 import random
+import time
 import multiprocessing as mp
-from functools import partial
 import numpy as np
-import pyarrow.parquet as pq
 from transformers import PreTrainedTokenizerFast
 import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
-
-BASE_DIR = "data/raw_corpus"
-OUTPUT_DIR = "data/mixed_50B_corpus"
-
-DOMAINS = {
-    "tamil": ["tamil_wikipedia", "indiccorp_tamil"],
-    "code": ["starcoder"],
-    "math": ["finemath", "pes2o"],
-    "english": ["fineweb_edu", "cosmopedia", "wikipedia"]
-}
+from datasets import load_dataset
+import pyarrow.parquet as pq
 
 # FIM Rates
-FIM_RATE_CODE = 0.70
-AST_FIM_RATIO = 0.90 # 90% of FIM is AST-FIM, 10% is random
+FIM_RATE_CODE = 0.50
+FIM_RATE_TEXT = 0.10 # Lower rate for natural language to protect L2R coherence
+AST_FIM_RATIO = 0.70 # 70% AST-FIM (structural), 30% random (mid-token)
 
-def stream_folder(folder_path, skip_patterns=None):
-    """Safely stream text from a folder without loading everything into memory."""
-    for f in glob.glob(os.path.join(folder_path, "**", "*.txt"), recursive=True):
-        if skip_patterns and any(p in f for p in skip_patterns): continue
-        try:
-            with open(f, 'r', encoding='utf-8') as file:
-                for line in file:
-                    line = line.strip()
-                    if line: yield line
-        except Exception: pass
+def format_fim(prefix, middle, suffix):
+    if random.random() < 0.5:
+        # PSM format (Prefix-Suffix-Middle)
+        return f"<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>{middle}<|im_end|>"
+    else:
+        # SPM format (Suffix-Prefix-Middle)
+        return f"<|fim_suffix|>{suffix}<|fim_prefix|>{prefix}<|fim_middle|>{middle}<|im_end|>"
 
+def stream_folder(folder_path):
+    import glob
     for f in glob.glob(os.path.join(folder_path, "**", "*.parquet"), recursive=True):
-        if skip_patterns and any(p in f for p in skip_patterns): continue
         try:
-            schema = pq.read_schema(f)
-            col_name = 'text' if 'text' in schema.names else 'content'
-            table = pq.read_table(f, columns=[col_name])
-            for val in table[col_name]:
+            table = pq.read_table(f, columns=["text"])
+            for val in table["text"]:
                 text = val.as_py()
-                if text and len(text.strip()) > 0: yield text
-        except Exception: pass
-
-    for f in glob.glob(os.path.join(folder_path, "**", "*.json.gz"), recursive=True):
-        if skip_patterns and any(p in f for p in skip_patterns): continue
-        try:
-            with gzip.open(f, 'rt', encoding='utf-8') as file:
-                for line in file:
-                    obj = json.loads(line)
-                    text = obj.get("text", "")
-                    if text and len(text.strip()) > 0: yield text
-        except Exception: pass
+                if text and len(text.strip()) > 0:
+                    yield text
+        except Exception:
+            pass
 
 def get_ast_nodes(root_node, valid_nodes):
     stack = [root_node]
@@ -74,7 +51,6 @@ def apply_ast_fim(text, parser):
         if not valid_nodes:
             return apply_random_fim(text)
             
-        # Select node with probability proportional to size
         weights = [n.end_byte - n.start_byte for n in valid_nodes]
         total_weight = sum(weights)
         if total_weight == 0:
@@ -91,9 +67,8 @@ def apply_ast_fim(text, parser):
         middle = text_bytes[start_byte:end_byte].decode("utf8", errors="ignore")
         suffix = text_bytes[end_byte:].decode("utf8", errors="ignore")
         
-        return f"<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>{middle}<|im_end|>"
+        return format_fim(prefix, middle, suffix)
     except Exception:
-        # Fallback to random FIM on parse failure
         return apply_random_fim(text)
 
 def apply_random_fim(text):
@@ -108,15 +83,14 @@ def apply_random_fim(text):
     middle = "".join(chars[split1:split2])
     suffix = "".join(chars[split2:])
     
-    return f"<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>{middle}<|im_end|>"
+    return format_fim(prefix, middle, suffix)
 
 def process_document(args):
     text, domain = args
     
-    if domain == "code":
+    if domain == "code_python":
         if random.random() < FIM_RATE_CODE:
             if random.random() < AST_FIM_RATIO:
-                # Tree-sitter objects are not picklable, must initialize per-process
                 global THREAD_PARSER
                 if 'THREAD_PARSER' not in globals():
                     PY_LANGUAGE = Language(tspython.language())
@@ -124,8 +98,63 @@ def process_document(args):
                 return apply_ast_fim(text, THREAD_PARSER)
             else:
                 return apply_random_fim(text)
+    elif domain == "code_sql":
+        if random.random() < FIM_RATE_CODE:
+            return apply_random_fim(text)
+    else:
+        # Math, English, Tamil
+        if random.random() < FIM_RATE_TEXT:
+            return apply_random_fim(text)
                 
     return text + "<|im_end|>"
+
+class WeightedDomainGenerator:
+    def __init__(self, target_weights, base_dir):
+        self.weights = target_weights
+        self.domain_names = list(self.weights.keys())
+        self.probs = list(self.weights.values())
+        self.generators = {}
+        self.base_dir = base_dir
+        
+        # Local directories mapped to domains
+        folders = {
+            "math": ["finemath"],
+            "code_python": ["starcoder/python"],
+            "code_sql": ["starcoder/sql"],
+            "english": ["fineweb_edu"],
+            "tamil": ["tamil"]
+        }
+        
+        for domain, f_list in folders.items():
+            self.generators[domain] = self._create_domain_generator(f_list)
+            
+    def _create_domain_generator(self, folders):
+        while True:
+            yielded_any = False
+            for folder in folders:
+                folder_path = os.path.join(self.base_dir, folder)
+                if not os.path.exists(folder_path):
+                    continue
+                for text in stream_folder(folder_path):
+                    yield text
+                    yielded_any = True
+            if not yielded_any:
+                while True:
+                    yield None
+        
+    def __iter__(self):
+        return self
+        
+    def __next__(self):
+        attempts = 0
+        while attempts < 100:
+            sampled_domain = random.choices(self.domain_names, weights=self.probs, k=1)[0]
+            gen = self.generators[sampled_domain]
+            text = next(gen)
+            if text is not None:
+                return text, sampled_domain
+            attempts += 1
+        raise StopIteration("Failed to stream any document after multiple attempts.")
 
 def chunk_iterator(iterator, size):
     chunk = []
@@ -137,7 +166,8 @@ def chunk_iterator(iterator, size):
     if chunk:
         yield chunk
 
-def build_corpus(samples_per_domain=float('inf'), chunk_size=3000, resume=True, split_phases=False):
+def build_corpus(samples_per_domain=float('inf'), chunk_size=1000, resume=True, split_phases=False):
+    BASE_DIR = "data/raw_corpus"
     OUTPUT_DIR_PHASE1 = "data/phase1_corpus"
     OUTPUT_DIR_PHASE2 = "data/phase2_corpus"
     OUTPUT_DIR_PHASE3 = "data/phase3_corpus"
@@ -149,111 +179,97 @@ def build_corpus(samples_per_domain=float('inf'), chunk_size=3000, resume=True, 
         current_output_dir = OUTPUT_DIR_PHASE1
         current_phase = 1
     else:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        current_output_dir = OUTPUT_DIR
+        os.makedirs("data/mixed_50B_corpus", exist_ok=True)
+        current_output_dir = "data/mixed_50B_corpus"
     
     print("Loading Tokenizer...")
-    tokenizer = PreTrainedTokenizerFast.from_pretrained("models/tokenizer")
+    tokenizer = PreTrainedTokenizerFast.from_pretrained("models/tokenizer_bpe_65528_agentic_reasoning")
     
-    # Generate tasks
+    # Target weights: Math 35%, Code Python 28%, Code SQL 7%, English 20%, Tamil 10%
+    target_weights = {
+        "math": 0.35,
+        "code_python": 0.28,
+        "code_sql": 0.07,
+        "english": 0.20,
+        "tamil": 0.10
+    }
+    
+    generator = WeightedDomainGenerator(target_weights, BASE_DIR)
+    
     def task_generator():
-        for domain, folders in DOMAINS.items():
-            if resume and domain in ["tamil", "code"]:
-                continue
-            yielded = 0
-            for folder in folders:
-                if resume and folder == "finemath":
-                    continue
-                folder_path = os.path.join(BASE_DIR, folder)
-                if not os.path.exists(folder_path): continue
-                
-                skip_patterns = None
-                if resume and folder == "pes2o":
-                    # skip train-00000 to train-00013
-                    skip_patterns = [f"train-{i:05d}" for i in range(14)]
-                    
-                for text in stream_folder(folder_path, skip_patterns):
-                    yield (text, domain)
-                    yielded += 1
-                    if yielded >= samples_per_domain:
-                        break
-                if yielded >= samples_per_domain:
-                    break
+        yielded = 0
+        for text, domain in generator:
+            yield (text, domain)
+            yielded += 1
+            if yielded >= samples_per_domain:
+                break
 
     print("Starting Multiprocessing Pipeline...")
-    # Set processes=8 and chunk_size=3000 to guarantee stability and prevent OOM killer
     pool = mp.Pool(processes=8)
     
-    file_idx = 149 if resume else 0
+    file_idx = 0
     MAX_TOKENS_PER_FILE = 250_000_000 # ~500MB per bin file
     
-    total_tokens_written = file_idx * MAX_TOKENS_PER_FILE if resume else 0
-    PHASE1_LIMIT = 40_000_000_000
-    PHASE2_LIMIT = 47_000_000_000
-    
-    if split_phases:
-        if total_tokens_written >= PHASE2_LIMIT:
-            current_phase = 3
-            current_output_dir = OUTPUT_DIR_PHASE3
-        elif total_tokens_written >= PHASE1_LIMIT:
-            current_phase = 2
-            current_output_dir = OUTPUT_DIR_PHASE2
-        else:
-            current_phase = 1
-            current_output_dir = OUTPUT_DIR_PHASE1
+    total_tokens_written = 0
+    PHASE1_LIMIT = 35_000_000_000  # Phase 1: 0 - 35B
+    PHASE2_LIMIT = 46_000_000_000  # Phase 2: 35B - 46B
     
     buffer = np.zeros(MAX_TOKENS_PER_FILE, dtype=np.uint16)
     buffer_idx = 0
     
-    for raw_chunk in chunk_iterator(task_generator(), chunk_size):
-        batch_results = pool.map(process_document, raw_chunk)
-        encoded_batch = tokenizer(batch_results, add_special_tokens=True)["input_ids"]
-        
-        # Safety validation to prevent silent uint16 wrap-around/overflow
-        for tokens in encoded_batch:
-            if len(tokens) > 0 and max(tokens) > 65535:
-                raise ValueError(
-                    f"Token ID {max(tokens)} exceeds uint16 limit (65535)! "
-                    f"This will cause severe dataset corruption via silent wrap-around. "
-                    f"Please retrain your tokenizer with a smaller vocabulary size."
-                )
-                
-        for tokens in encoded_batch:
+    try:
+        for raw_chunk in chunk_iterator(task_generator(), chunk_size):
+            batch_results = pool.map(process_document, raw_chunk)
+            encoded_batch = tokenizer(batch_results, add_special_tokens=True)["input_ids"]
             
-            if buffer_idx + len(tokens) >= MAX_TOKENS_PER_FILE:
-                space_left = MAX_TOKENS_PER_FILE - buffer_idx
-                buffer[buffer_idx:] = tokens[:space_left]
-                
-                out_path = os.path.join(current_output_dir, f"corpus_{file_idx:04d}.bin")
-                mmap = np.memmap(out_path, dtype=np.uint16, mode='w+', shape=(MAX_TOKENS_PER_FILE,))
-                mmap[:] = buffer[:]
-                mmap.flush()
-                print(f"✅ Wrote {MAX_TOKENS_PER_FILE} tokens to {out_path}")
-                
-                total_tokens_written += MAX_TOKENS_PER_FILE
-                file_idx += 1
-                buffer_idx = 0
-                
-                if split_phases:
-                    if current_phase == 1 and total_tokens_written >= PHASE1_LIMIT:
-                        current_phase = 2
-                        current_output_dir = OUTPUT_DIR_PHASE2
-                        file_idx = 0 # reset file idx for new folder
-                        print("\n>>> TRANSITIONING TO PHASE 2 DATASET <<<\n")
-                    elif current_phase == 2 and total_tokens_written >= PHASE2_LIMIT:
-                        current_phase = 3
-                        current_output_dir = OUTPUT_DIR_PHASE3
-                        file_idx = 0 # reset file idx for new folder
-                        print("\n>>> TRANSITIONING TO PHASE 3 DATASET <<<\n")
-                
-                remaining_tokens = tokens[space_left:]
-                if len(remaining_tokens) > 0:
-                    buffer[:len(remaining_tokens)] = remaining_tokens
-                    buffer_idx = len(remaining_tokens)
-            else:
-                buffer[buffer_idx:buffer_idx+len(tokens)] = tokens
-                buffer_idx += len(tokens)
-
+            # Safety validation to prevent silent uint16 wrap-around/overflow
+            for tokens in encoded_batch:
+                if len(tokens) > 0 and max(tokens) > 65535:
+                    raise ValueError(
+                        f"Token ID {max(tokens)} exceeds uint16 limit (65535)! "
+                        f"Vocabulary exceeds safety boundary."
+                    )
+                    
+            for tokens in encoded_batch:
+                if buffer_idx + len(tokens) >= MAX_TOKENS_PER_FILE:
+                    space_left = MAX_TOKENS_PER_FILE - buffer_idx
+                    buffer[buffer_idx:] = tokens[:space_left]
+                    
+                    out_path = os.path.join(current_output_dir, f"corpus_{file_idx:04d}.bin")
+                    mmap = np.memmap(out_path, dtype=np.uint16, mode='w+', shape=(MAX_TOKENS_PER_FILE,))
+                    mmap[:] = buffer[:]
+                    mmap.flush()
+                    print(f"✅ Wrote {MAX_TOKENS_PER_FILE} tokens to {out_path}")
+                    
+                    total_tokens_written += MAX_TOKENS_PER_FILE
+                    file_idx += 1
+                    buffer_idx = 0
+                    
+                    if split_phases:
+                        if current_phase == 1 and total_tokens_written >= PHASE1_LIMIT:
+                            current_phase = 2
+                            current_output_dir = OUTPUT_DIR_PHASE2
+                            file_idx = 0 # reset file idx for new folder
+                            print("\n>>> TRANSITIONING TO PHASE 2 DATASET <<<\n")
+                        elif current_phase == 2 and total_tokens_written >= PHASE2_LIMIT:
+                            current_phase = 3
+                            current_output_dir = OUTPUT_DIR_PHASE3
+                            file_idx = 0 # reset file idx for new folder
+                            print("\n>>> TRANSITIONING TO PHASE 3 DATASET <<<\n")
+                    
+                    remaining_tokens = tokens[space_left:]
+                    if len(remaining_tokens) > 0:
+                        buffer[:len(remaining_tokens)] = remaining_tokens
+                        buffer_idx = len(remaining_tokens)
+                else:
+                    buffer[buffer_idx:buffer_idx+len(tokens)] = tokens
+                    buffer_idx += len(tokens)
+    except KeyboardInterrupt:
+        print("\nInterrupt received. Closing pool...")
+    finally:
+        pool.close()
+        pool.join()
+        
     # Write remaining
     if buffer_idx > 0:
         out_path = os.path.join(current_output_dir, f"corpus_{file_idx:04d}.bin")
@@ -261,15 +277,12 @@ def build_corpus(samples_per_domain=float('inf'), chunk_size=3000, resume=True, 
         mmap[:] = buffer[:buffer_idx]
         mmap.flush()
         print(f"✅ Wrote {buffer_idx} tokens to {out_path}")
-
-    pool.close()
-    pool.join()
+        
     print("🎉 Corpus generation complete!")
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--resume", action="store_true", help="Resume from previous partial build")
     parser.add_argument("--split_phases", action="store_true", help="Split output into phase1, phase2, phase3 for curriculum learning")
     args = parser.parse_args()
-    build_corpus(samples_per_domain=float('inf'), resume=args.resume, split_phases=args.split_phases)
+    build_corpus(samples_per_domain=float('inf'), resume=False, split_phases=args.split_phases)
