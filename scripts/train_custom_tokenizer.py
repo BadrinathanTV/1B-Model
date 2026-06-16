@@ -85,7 +85,7 @@ def train_tokenizer():
     print("\nInitializing Final Llama-3 ByteLevel BPE Tokenizer...")
     
     # 1. Base BPE Model
-    vocab_size = 65535
+    vocab_size = 65528
     tokenizer = Tokenizer(BPE())
     
     # 2. Pre-Tokenizer & Decoder (Llama-3 Architecture)

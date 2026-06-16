@@ -221,7 +221,11 @@ def main():
     # Checkpoint loading
     if args.checkpoint:
         if os.path.isdir(args.checkpoint):
-            bin_path = os.path.join(args.checkpoint, "pytorch_model.bin")
+            pt_path = os.path.join(args.checkpoint, "model.pt")
+            if os.path.exists(pt_path):
+                bin_path = pt_path
+            else:
+                bin_path = os.path.join(args.checkpoint, "pytorch_model.bin")
         else:
             bin_path = args.checkpoint
 

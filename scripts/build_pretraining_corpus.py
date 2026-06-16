@@ -181,6 +181,16 @@ def build_corpus(samples_per_domain=float('inf'), chunk_size=3000, resume=True):
     for raw_chunk in chunk_iterator(task_generator(), chunk_size):
         batch_results = pool.map(process_document, raw_chunk)
         encoded_batch = tokenizer(batch_results, add_special_tokens=True)["input_ids"]
+        
+        # Safety validation to prevent silent uint16 wrap-around/overflow
+        for tokens in encoded_batch:
+            if len(tokens) > 0 and max(tokens) > 65535:
+                raise ValueError(
+                    f"Token ID {max(tokens)} exceeds uint16 limit (65535)! "
+                    f"This will cause severe dataset corruption via silent wrap-around. "
+                    f"Please retrain your tokenizer with a smaller vocabulary size."
+                )
+                
         for tokens in encoded_batch:
             
             if buffer_idx + len(tokens) >= MAX_TOKENS_PER_FILE:
