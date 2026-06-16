@@ -161,14 +161,15 @@ class TestSLMStabilitySuite(unittest.TestCase):
         n_deltas = min(10, max_hist)
         deltas = [torch.randn(self.batch_size, self.seq_len, self.config.hidden_size, device=device) for _ in range(n_deltas)]
         
-        # Build buffer
+        # Build buffer and active_mask
         buf = torch.zeros(max_hist, self.batch_size, self.seq_len, self.config.hidden_size, device=device)
         for i, d in enumerate(deltas):
             buf[i] = d
-        num_deltas = torch.tensor([n_deltas], dtype=torch.long, device=device)
+        active_mask = torch.zeros(max_hist, self.batch_size, self.seq_len, dtype=torch.bool, device=device)
+        active_mask[:n_deltas] = True
         
         # Route through DeltaAttentionResidual
-        routed_x = routing_layer.forward_static(x, buf, num_deltas, routing_q)
+        routed_x = routing_layer(x, routing_q, delta_buffer=buf, active_mask=active_mask)
         
         # Calculate routed delta contribution: routed_x - x
         routed_contribution = routed_x - x

@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -50,7 +51,7 @@ class DeltaAttentionResidual(nn.Module):
 
             # Score each slot: use flattened F.linear to avoid einsum broadcast OOM
             nd_flat = nd.view(-1, H)
-            scores_flat = F.linear(nd_flat, routing_q)
+            scores_flat = F.linear(nd_flat, routing_q) / math.sqrt(H)
             scores = scores_flat.view(num_deltas, B, S)
 
             alpha = F.softmax(scores, dim=0)
@@ -71,7 +72,7 @@ class DeltaAttentionResidual(nn.Module):
         nd = F.rms_norm(delta_buffer, (self.hidden_size,), weight=None, eps=self.rms_norm_eps)
 
         # 2. Compute scores directly via einsum (safe during generation as B=1 usually)
-        scores = torch.einsum('nbsh, h -> nbs', nd, routing_q)
+        scores = torch.einsum('nbsh, h -> nbs', nd, routing_q) / math.sqrt(self.hidden_size)
 
         # 3. Mask out uninitialized slots with -inf
         scores = scores.masked_fill(~active_mask, float('-inf'))

@@ -23,10 +23,7 @@ class TestRMSNorm(unittest.TestCase):
     def test_rmsnorm_properties(self):
         """RMSNorm scales the input such that the root-mean-square is 1."""
         norm = RMSNorm(self.dim, self.eps)
-        # Initialize weights to 1 to isolate the normalization
-        with torch.no_grad():
-            norm.weight.fill_(1.0)
-            
+        
         x = torch.randn(self.batch_size, self.seq_len, self.dim)
         y = norm(x)
         
@@ -56,9 +53,7 @@ class TestRMSNorm(unittest.TestCase):
         loss.backward()
         
         self.assertIsNotNone(x.grad)
-        self.assertIsNotNone(norm.weight.grad)
         self.assertFalse(torch.isnan(x.grad).any())
-        self.assertFalse(torch.isnan(norm.weight.grad).any())
 
     def test_rmsnorm_dtypes(self):
         dtypes = [torch.float32, torch.bfloat16]

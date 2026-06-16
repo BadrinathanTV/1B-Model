@@ -32,3 +32,8 @@ dependencies = [
 [tool.pyright]
 extraPaths = ["training", "4bit_training"]
 
+[dependency-groups]
+dev = [
+    "pytest>=9.1.0",
+]
+

@@ -133,6 +133,7 @@ class SLMConfig:
     # Weight Tying & Memory Optimizations
     tie_word_embeddings: bool = True
     max_delta_history: int = 0  # 0 means keep full history
+    delta_block_size: int = 1   # 1 = per-sublayer (Delta AttnRes), 2 = per-layer (Delta Block)
     gradient_checkpointing: bool = True # Set to False for massive speedup if VRAM allows
     gradient_checkpointing_interval: int = 1 # Checkpoint every N layers (higher = faster but more memory)
 
@@ -163,6 +164,8 @@ class SLMConfig:
             raise ValueError(f"output_logit_scale must be positive, got {self.output_logit_scale}")
         if self.max_delta_history < 0:
             raise ValueError(f"max_delta_history must be >= 0, got {self.max_delta_history}")
+        if self.delta_block_size not in (1, 2):
+            raise ValueError(f"delta_block_size must be 1 or 2, got {self.delta_block_size}")
         if self.mtp_depth < 1:
             raise ValueError(f"mtp_depth must be >= 1, got {self.mtp_depth}")
 

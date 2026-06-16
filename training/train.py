@@ -213,6 +213,7 @@ class PretrainingDataset(Dataset):
 
         return inputs, targets
 
+
 def evaluate(model, dataloader, accelerator, config, lm_head_weight, freqs_cis, cos_cache, sin_cache, eval_steps=50):
     """Run evaluation and return mean validation loss."""
     model.eval()
@@ -265,6 +266,10 @@ def main():
     parser.add_argument(
         "--checkpoint_interval", type=int, default=500,
         help="Steps between saving checkpoints and running validation",
+    )
+    parser.add_argument(
+        "--resume_weights", type=str, default=None,
+        help="Path to a model.pt file to initialize model weights independently (bypasses full state resume)",
     )
     parser.add_argument(
         "--compile", action="store_true",
@@ -399,11 +404,22 @@ def main():
 
     accelerator.print("      Done.\n", flush=True)
 
-    # ── Checkpoint Resume ──
+    # ── Checkpoint Resume / Independent Weight Init ──
     global_step = 0
     resume_dir = None
-    if os.path.exists(args.checkpoint_dir):
-        # Find latest checkpoint-X folder
+    
+    if args.resume_weights and os.path.exists(args.resume_weights):
+        accelerator.print(f"\n[4.5] Loading INDEPENDENT model weights from {args.resume_weights}...", flush=True)
+        try:
+            state_dict = torch.load(args.resume_weights, map_location="cpu")
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.load_state_dict(state_dict, strict=True)
+            accelerator.print("      ✓ Independent weights loaded successfully. Starting new curriculum phase.", flush=True)
+        except Exception as e:
+            accelerator.print(f"      ✗ Failed to load weights: {e}", flush=True)
+            raise e
+    elif os.path.exists(args.checkpoint_dir):
+        # Find latest checkpoint-X folder for standard resume
         subdirs = glob.glob(os.path.join(args.checkpoint_dir, "checkpoint-*"))
         if subdirs:
             try:
@@ -416,9 +432,9 @@ def main():
         if resume_dir:
             try:
                 accelerator.load_state(resume_dir)
-                accelerator.print(f"Resumed from checkpoint: {resume_dir} at step {global_step}", flush=True)
+                accelerator.print(f"Resumed from full state checkpoint: {resume_dir} at step {global_step}", flush=True)
             except Exception as e:
-                accelerator.print(f"Could not load checkpoint from {resume_dir}: {e}", flush=True)
+                accelerator.print(f"Could not load full checkpoint from {resume_dir}: {e}", flush=True)
                 global_step = 0
 
     # ── Get lm_head weight for fused CE ──
@@ -438,6 +454,7 @@ def main():
     data_iter = iter(dataloader)
 
     for step in range(global_step, train_cfg.max_steps):
+
         # Periodic MTP Curriculum: Interleave MTP training within each checkpoint interval
         interval = args.checkpoint_interval
         mtp_start_step_in_interval = int(interval * 0.8)

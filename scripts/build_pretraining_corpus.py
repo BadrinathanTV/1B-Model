@@ -137,8 +137,20 @@ def chunk_iterator(iterator, size):
     if chunk:
         yield chunk
 
-def build_corpus(samples_per_domain=float('inf'), chunk_size=3000, resume=True):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+def build_corpus(samples_per_domain=float('inf'), chunk_size=3000, resume=True, split_phases=False):
+    OUTPUT_DIR_PHASE1 = "data/phase1_corpus"
+    OUTPUT_DIR_PHASE2 = "data/phase2_corpus"
+    OUTPUT_DIR_PHASE3 = "data/phase3_corpus"
+    
+    if split_phases:
+        os.makedirs(OUTPUT_DIR_PHASE1, exist_ok=True)
+        os.makedirs(OUTPUT_DIR_PHASE2, exist_ok=True)
+        os.makedirs(OUTPUT_DIR_PHASE3, exist_ok=True)
+        current_output_dir = OUTPUT_DIR_PHASE1
+        current_phase = 1
+    else:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        current_output_dir = OUTPUT_DIR
     
     print("Loading Tokenizer...")
     tokenizer = PreTrainedTokenizerFast.from_pretrained("models/tokenizer")
@@ -175,6 +187,21 @@ def build_corpus(samples_per_domain=float('inf'), chunk_size=3000, resume=True):
     file_idx = 149 if resume else 0
     MAX_TOKENS_PER_FILE = 250_000_000 # ~500MB per bin file
     
+    total_tokens_written = file_idx * MAX_TOKENS_PER_FILE if resume else 0
+    PHASE1_LIMIT = 40_000_000_000
+    PHASE2_LIMIT = 47_000_000_000
+    
+    if split_phases:
+        if total_tokens_written >= PHASE2_LIMIT:
+            current_phase = 3
+            current_output_dir = OUTPUT_DIR_PHASE3
+        elif total_tokens_written >= PHASE1_LIMIT:
+            current_phase = 2
+            current_output_dir = OUTPUT_DIR_PHASE2
+        else:
+            current_phase = 1
+            current_output_dir = OUTPUT_DIR_PHASE1
+    
     buffer = np.zeros(MAX_TOKENS_PER_FILE, dtype=np.uint16)
     buffer_idx = 0
     
@@ -197,14 +224,27 @@ def build_corpus(samples_per_domain=float('inf'), chunk_size=3000, resume=True):
                 space_left = MAX_TOKENS_PER_FILE - buffer_idx
                 buffer[buffer_idx:] = tokens[:space_left]
                 
-                out_path = os.path.join(OUTPUT_DIR, f"corpus_{file_idx:04d}.bin")
+                out_path = os.path.join(current_output_dir, f"corpus_{file_idx:04d}.bin")
                 mmap = np.memmap(out_path, dtype=np.uint16, mode='w+', shape=(MAX_TOKENS_PER_FILE,))
                 mmap[:] = buffer[:]
                 mmap.flush()
                 print(f"✅ Wrote {MAX_TOKENS_PER_FILE} tokens to {out_path}")
                 
+                total_tokens_written += MAX_TOKENS_PER_FILE
                 file_idx += 1
                 buffer_idx = 0
+                
+                if split_phases:
+                    if current_phase == 1 and total_tokens_written >= PHASE1_LIMIT:
+                        current_phase = 2
+                        current_output_dir = OUTPUT_DIR_PHASE2
+                        file_idx = 0 # reset file idx for new folder
+                        print("\n>>> TRANSITIONING TO PHASE 2 DATASET <<<\n")
+                    elif current_phase == 2 and total_tokens_written >= PHASE2_LIMIT:
+                        current_phase = 3
+                        current_output_dir = OUTPUT_DIR_PHASE3
+                        file_idx = 0 # reset file idx for new folder
+                        print("\n>>> TRANSITIONING TO PHASE 3 DATASET <<<\n")
                 
                 remaining_tokens = tokens[space_left:]
                 if len(remaining_tokens) > 0:
@@ -216,7 +256,7 @@ def build_corpus(samples_per_domain=float('inf'), chunk_size=3000, resume=True):
 
     # Write remaining
     if buffer_idx > 0:
-        out_path = os.path.join(OUTPUT_DIR, f"corpus_{file_idx:04d}.bin")
+        out_path = os.path.join(current_output_dir, f"corpus_{file_idx:04d}.bin")
         mmap = np.memmap(out_path, dtype=np.uint16, mode='w+', shape=(buffer_idx,))
         mmap[:] = buffer[:buffer_idx]
         mmap.flush()
@@ -227,4 +267,9 @@ def build_corpus(samples_per_domain=float('inf'), chunk_size=3000, resume=True):
     print("🎉 Corpus generation complete!")
 
 if __name__ == "__main__":
-    build_corpus(samples_per_domain=float('inf')) # Process the entire 50B dataset
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", action="store_true", help="Resume from previous partial build")
+    parser.add_argument("--split_phases", action="store_true", help="Split output into phase1, phase2, phase3 for curriculum learning")
+    args = parser.parse_args()
+    build_corpus(samples_per_domain=float('inf'), resume=args.resume, split_phases=args.split_phases)

@@ -40,15 +40,16 @@ def make_config(**overrides):
 
 
 def _make_buffer_from_deltas(deltas, max_hist, batch, seq_len, hidden):
-    """Create a deltas_buf and num_deltas from a list of delta tensors."""
+    """Create a deltas_buf and active_mask from a list of delta tensors."""
     device = deltas[0].device if deltas else torch.device('cpu')
     dtype = deltas[0].dtype if deltas else torch.float32
     buf = torch.zeros(max_hist, batch, seq_len, hidden, device=device, dtype=dtype)
+    active_mask = torch.zeros(max_hist, batch, seq_len, dtype=torch.bool, device=device)
     n = min(len(deltas), max_hist)
     for i in range(n):
         buf[i] = deltas[i]
-    num_deltas = torch.tensor([n], dtype=torch.long, device=device)
-    return buf, num_deltas
+        active_mask[i] = True
+    return buf, active_mask
 
 
 class TestDeltaResidualCorrectness(unittest.TestCase):
@@ -62,9 +63,9 @@ class TestDeltaResidualCorrectness(unittest.TestCase):
         x = torch.randn(2, 8, 64)
         routing_q = nn.Parameter(torch.randn(64))
         buf = torch.zeros(max_hist, 2, 8, 64)
-        num_deltas = torch.tensor([0], dtype=torch.long)
+        active_mask = torch.zeros(max_hist, 2, 8, dtype=torch.bool)
 
-        out = layer.forward_static(x, buf, num_deltas, routing_q)
+        out = layer.forward(x, routing_q, delta_buffer=buf, active_mask=active_mask)
         self.assertTrue(torch.allclose(out, x, atol=1e-5),
                         "With empty deltas, output should be identical to input.")
 
@@ -77,8 +78,8 @@ class TestDeltaResidualCorrectness(unittest.TestCase):
         delta = torch.randn(2, 8, 64)
         routing_q = nn.Parameter(torch.randn(64))
 
-        buf, num_deltas = _make_buffer_from_deltas([delta], max_hist, 2, 8, 64)
-        out = layer.forward_static(x, buf, num_deltas, routing_q)
+        buf, active_mask = _make_buffer_from_deltas([delta], max_hist, 2, 8, 64)
+        out = layer.forward(x, routing_q, delta_buffer=buf, active_mask=active_mask)
 
         # With a single delta, softmax produces alpha=1.0 -> routed = delta
         expected = x + delta
@@ -96,8 +97,8 @@ class TestDeltaResidualCorrectness(unittest.TestCase):
             n_actual = min(n_deltas, max_hist)
             x = torch.randn(4, 8, 64)
             deltas = [torch.randn(4, 8, 64) for _ in range(n_actual)]
-            buf, num_deltas = _make_buffer_from_deltas(deltas, max_hist, 4, 8, 64)
-            out = layer.forward_static(x, buf, num_deltas, routing_q)
+            buf, active_mask = _make_buffer_from_deltas(deltas, max_hist, 4, 8, 64)
+            out = layer.forward(x, routing_q, delta_buffer=buf, active_mask=active_mask)
             self.assertEqual(out.shape, x.shape,
                              f"Output shape mismatch with {n_deltas} deltas.")
 
@@ -114,7 +115,7 @@ class TestDeltaResidualGradients(unittest.TestCase):
         deltas = [torch.randn(2, 8, 64, requires_grad=True) for _ in range(3)]
         routing_q = nn.Parameter(torch.randn(64))
 
-        buf, num_deltas = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
+        buf, active_mask = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
         # Re-create buf with grad tracking: stack from deltas
         buf = torch.zeros(max_hist, 2, 8, 64, requires_grad=True)
         with torch.no_grad():
@@ -122,7 +123,7 @@ class TestDeltaResidualGradients(unittest.TestCase):
                 buf.data[i] = d
         buf = buf + 0  # force into computational graph
 
-        out = layer.forward_static(x, buf, num_deltas, routing_q)
+        out = layer.forward(x, routing_q, delta_buffer=buf, active_mask=active_mask)
         loss = out.sum()
         loss.backward()
 
@@ -138,8 +139,8 @@ class TestDeltaResidualGradients(unittest.TestCase):
         routing_q = nn.Parameter(torch.randn(64))
 
         deltas = [torch.randn(2, 8, 64) for _ in range(3)]
-        buf, num_deltas = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
-        out = layer.forward_static(x, buf, num_deltas, routing_q)
+        buf, active_mask = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
+        out = layer.forward(x, routing_q, delta_buffer=buf, active_mask=active_mask)
         loss = out.sum()
         loss.backward()
 
@@ -160,8 +161,8 @@ class TestDeltaResidualGradients(unittest.TestCase):
         routing_q = nn.Parameter(torch.zeros(64))
         deltas = [torch.randn(2, 8, 64) for _ in range(4)]
 
-        buf, num_deltas = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
-        out = layer.forward_static(x, buf, num_deltas, routing_q)
+        buf, active_mask = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
+        out = layer.forward(x, routing_q, delta_buffer=buf, active_mask=active_mask)
         loss = out.sum()
         loss.backward()
 
@@ -181,9 +182,9 @@ class TestDeltaResidualNumericalStability(unittest.TestCase):
         x = torch.randn(2, 8, 64)
         routing_q = nn.Parameter(torch.randn(64))
         deltas = [torch.zeros(2, 8, 64) for _ in range(3)]
-        buf, num_deltas = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
+        buf, active_mask = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
 
-        out = layer.forward_static(x, buf, num_deltas, routing_q)
+        out = layer.forward(x, routing_q, delta_buffer=buf, active_mask=active_mask)
         self.assertFalse(torch.isnan(out).any(), "Zero deltas must not produce NaN.")
         self.assertFalse(torch.isinf(out).any(), "Zero deltas must not produce Inf.")
 
@@ -195,9 +196,9 @@ class TestDeltaResidualNumericalStability(unittest.TestCase):
         x = torch.randn(2, 8, 64)
         routing_q = nn.Parameter(torch.randn(64))
         deltas = [torch.randn(2, 8, 64) * 1e6 for _ in range(3)]
-        buf, num_deltas = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
+        buf, active_mask = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
 
-        out = layer.forward_static(x, buf, num_deltas, routing_q)
+        out = layer.forward(x, routing_q, delta_buffer=buf, active_mask=active_mask)
         self.assertFalse(torch.isnan(out).any(), "Large deltas must not produce NaN.")
         self.assertFalse(torch.isinf(out).any(), "Large deltas must not produce Inf.")
 
@@ -209,9 +210,9 @@ class TestDeltaResidualNumericalStability(unittest.TestCase):
         x = torch.randn(2, 8, 64)
         routing_q = nn.Parameter(torch.randn(64))
         deltas = [torch.randn(2, 8, 64) * 1e-10 for _ in range(3)]
-        buf, num_deltas = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
+        buf, active_mask = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
 
-        out = layer.forward_static(x, buf, num_deltas, routing_q)
+        out = layer.forward(x, routing_q, delta_buffer=buf, active_mask=active_mask)
         self.assertFalse(torch.isnan(out).any(), "Tiny deltas must not produce NaN.")
         self.assertFalse(torch.isinf(out).any(), "Tiny deltas must not produce Inf.")
 
@@ -227,9 +228,9 @@ class TestDeltaResidualNumericalStability(unittest.TestCase):
             torch.randn(2, 8, 64) * 1.0,
             torch.randn(2, 8, 64) * 1e6,
         ]
-        buf, num_deltas = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
+        buf, active_mask = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
 
-        out = layer.forward_static(x, buf, num_deltas, routing_q)
+        out = layer.forward(x, routing_q, delta_buffer=buf, active_mask=active_mask)
         self.assertFalse(torch.isnan(out).any(), "Mixed magnitude deltas must not produce NaN.")
         self.assertFalse(torch.isinf(out).any(), "Mixed magnitude deltas must not produce Inf.")
 
@@ -241,10 +242,10 @@ class TestDeltaResidualNumericalStability(unittest.TestCase):
         x = torch.randn(2, 8, 64, dtype=torch.bfloat16)
         routing_q = nn.Parameter(torch.randn(64, dtype=torch.bfloat16))
         deltas = [torch.randn(2, 8, 64, dtype=torch.bfloat16) for _ in range(5)]
-        buf, num_deltas = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
+        buf, active_mask = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
         buf = buf.bfloat16()
 
-        out = layer.forward_static(x, buf, num_deltas, routing_q)
+        out = layer.forward(x, routing_q, delta_buffer=buf, active_mask=active_mask)
         self.assertFalse(torch.isnan(out).any(), "bfloat16 must not produce NaN.")
         self.assertFalse(torch.isinf(out).any(), "bfloat16 must not produce Inf.")
 
@@ -262,13 +263,13 @@ class TestDeltaResidualIntegration(unittest.TestCase):
         layer = DeltaAttentionResidual(config)
         x = torch.randn(2, 8, 64)
         deltas = [torch.randn(2, 8, 64) for _ in range(5)]
-        buf, num_deltas = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
+        buf, active_mask = _make_buffer_from_deltas(deltas, max_hist, 2, 8, 64)
 
         q1 = nn.Parameter(torch.randn(64))
         q2 = nn.Parameter(torch.randn(64))
 
-        out1 = layer.forward_static(x, buf, num_deltas, q1)
-        out2 = layer.forward_static(x, buf, num_deltas, q2)
+        out1 = layer.forward(x, q1, delta_buffer=buf, active_mask=active_mask)
+        out2 = layer.forward(x, q2, delta_buffer=buf, active_mask=active_mask)
 
         self.assertFalse(torch.allclose(out1, out2, atol=1e-5),
                          "Different routing queries must produce different outputs.")
@@ -288,13 +289,13 @@ class TestDeltaResidualIntegration(unittest.TestCase):
         d2 = [torch.randn(1, 8, 64) for _ in range(3)]
         d_batch = [torch.cat([a, b], dim=0) for a, b in zip(d1, d2)]
 
-        buf_batch, nd_batch = _make_buffer_from_deltas(d_batch, max_hist, 2, 8, 64)
-        buf1, nd1 = _make_buffer_from_deltas(d1, max_hist, 1, 8, 64)
-        buf2, nd2 = _make_buffer_from_deltas(d2, max_hist, 1, 8, 64)
+        buf_batch, mask_batch = _make_buffer_from_deltas(d_batch, max_hist, 2, 8, 64)
+        buf1, mask1 = _make_buffer_from_deltas(d1, max_hist, 1, 8, 64)
+        buf2, mask2 = _make_buffer_from_deltas(d2, max_hist, 1, 8, 64)
 
-        out_batch = layer.forward_static(x_batch, buf_batch, nd_batch, routing_q)
-        out1 = layer.forward_static(x1, buf1, nd1, routing_q)
-        out2 = layer.forward_static(x2, buf2, nd2, routing_q)
+        out_batch = layer.forward(x_batch, routing_q, delta_buffer=buf_batch, active_mask=mask_batch)
+        out1 = layer.forward(x1, routing_q, delta_buffer=buf1, active_mask=mask1)
+        out2 = layer.forward(x2, routing_q, delta_buffer=buf2, active_mask=mask2)
 
         self.assertTrue(torch.allclose(out_batch[0], out1[0], atol=1e-5),
                         "Batch element 0 must match independent computation.")

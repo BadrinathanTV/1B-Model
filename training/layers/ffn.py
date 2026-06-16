@@ -28,12 +28,11 @@ class DenseFFN(nn.Module):
         # torch.chunk creates a zero-copy view. No memory is allocated here!
         gate, up = gate_up.chunk(2, dim=-1)
         
-        if LIGER_SWIGLU and x.is_cuda:
+        if LIGER_SWIGLU and x.is_cuda and self.training:
             # Liger's Triton kernel natively understands chunked memory strides
             hidden = LigerSiLUMulFunction.apply(gate, up)
         else:
-            # If torch.compile is wrapping this, PyTorch Inductor will automatically 
-            # fuse this math into a custom Triton kernel anyway!
+            # Eager/Inductor fallback for inference or CPU
             hidden = F.silu(gate) * up
             
         return self.down_proj(hidden)

@@ -13,6 +13,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from config import SLMConfig
@@ -35,10 +36,12 @@ class TransformerBlock(nn.Module):
         self.layer_idx = layer_idx
         self.config = config
         self.max_delta_history = config.max_delta_history
+        self.delta_block_size = getattr(config, "delta_block_size", 1)
         # Resolve max_delta_history=0 ("full history") to a concrete buffer size.
-        # Each layer produces 2 deltas (attn + ffn), so the physical max is 2*num_layers.
+        # Each layer produces 2 deltas (attn + ffn). If block size is 2, it produces 1 block delta per layer.
         if self.max_delta_history == 0:
-            self.max_delta_history = 2 * config.num_hidden_layers
+            sublayers = 2 // self.delta_block_size
+            self.max_delta_history = sublayers * config.num_hidden_layers
 
         # Pre-norms (standard)
         self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -61,7 +64,7 @@ class TransformerBlock(nn.Module):
 
 
     def forward(self, x, past_deltas=None, delta_buffer=None, active_mask=None, current_idx=None, 
-                freqs_cis=None, cos_cache=None, sin_cache=None, past_key_value=None):
+                freqs_cis=None, cos_cache=None, sin_cache=None, past_key_value=None, use_cache=False):
         
         # ---------------------------------------------------------
         # 1. ATTENTION SUBLAYER
@@ -76,9 +79,10 @@ class TransformerBlock(nn.Module):
         attn_out = self.attn(
             self.attn_norm(h_attn), freqs_cis=freqs_cis,
             cos_cache=cos_cache, sin_cache=sin_cache,
-            past_key_value=past_key_value
+            past_key_value=past_key_value,
+            use_cache=use_cache
         )
-        if past_key_value is not None:
+        if use_cache or past_key_value is not None:
             v_attn, present_key_value = attn_out
         else:
             v_attn = attn_out
@@ -89,16 +93,22 @@ class TransformerBlock(nn.Module):
 
         # Update static buffer for generation
         if delta_buffer is not None:
-            delta_buffer, active_mask, current_idx = self.delta_residual.update_state(
-                v_attn, delta_buffer, active_mask, current_idx
-            )
+            if self.delta_block_size == 1:
+                delta_buffer, active_mask, current_idx = self.delta_residual.update_state(
+                    v_attn, delta_buffer, active_mask, current_idx
+                )
 
         # ---------------------------------------------------------
         # 2. FFN SUBLAYER
         # ---------------------------------------------------------
         # If using lists (training), the FFN needs access to v_attn!
         if past_deltas is not None:
-            current_past_deltas = past_deltas + [v_attn]
+            if self.delta_block_size == 1:
+                current_past_deltas = past_deltas + [v_attn]
+            else:
+                # Delta Block: attend only to completed previous blocks
+                current_past_deltas = past_deltas
+                
             if len(current_past_deltas) > self.max_delta_history:
                 current_past_deltas = current_past_deltas[-self.max_delta_history:]
         else:
@@ -116,12 +126,18 @@ class TransformerBlock(nn.Module):
 
         # Update static buffer for generation
         if delta_buffer is not None:
-            delta_buffer, active_mask, current_idx = self.delta_residual.update_state(
-                v_ffn, delta_buffer, active_mask, current_idx
-            )
+            if self.delta_block_size == 1:
+                delta_buffer, active_mask, current_idx = self.delta_residual.update_state(
+                    v_ffn, delta_buffer, active_mask, current_idx
+                )
+            else:
+                # Delta Block: Update buffer with the complete layer sum
+                delta_buffer, active_mask, current_idx = self.delta_residual.update_state(
+                    v_attn + v_ffn, delta_buffer, active_mask, current_idx
+                )
 
         # Return the new deltas so the model loop can append them safely
-        if past_key_value is not None:
+        if use_cache or past_key_value is not None:
             return x, v_attn, v_ffn, delta_buffer, active_mask, current_idx, present_key_value
         return x, v_attn, v_ffn, delta_buffer, active_mask, current_idx
 
@@ -200,7 +216,8 @@ class SLMModel(nn.Module):
 
         max_deltas = self.config.max_delta_history
         if max_deltas == 0:
-            max_deltas = 2 * self.config.num_hidden_layers
+            sublayers = 2 // getattr(self.config, "delta_block_size", 1)
+            max_deltas = sublayers * self.config.num_hidden_layers
 
         # --- Phase Routing: Lists for Training, Buffers for Generation ---
         if self.training or not use_cache:
@@ -215,6 +232,9 @@ class SLMModel(nn.Module):
 
         interval = getattr(self.config, "gradient_checkpointing_interval", 1)
 
+        if use_cache and past_key_values is None:
+            past_key_values = [None] * len(self.layers)
+
         for i, layer in enumerate(self.layers):
             layer_past_key_value = past_key_values[i] if past_key_values is not None else None
             
@@ -224,24 +244,31 @@ class SLMModel(nn.Module):
                 out = checkpoint(
                     layer, x, past_deltas, delta_buffer, active_mask, current_idx,
                     freqs_cis, cos_cache, sin_cache, layer_past_key_value,
+                    use_cache,
                     use_reentrant=False
                 )
             else:
                 out = layer(
                     x, past_deltas, delta_buffer, active_mask, current_idx,
                     freqs_cis=freqs_cis, cos_cache=cos_cache, sin_cache=sin_cache,
-                    past_key_value=layer_past_key_value
+                    past_key_value=layer_past_key_value,
+                    use_cache=use_cache
                 )
             
-            if layer_past_key_value is not None:
+            if use_cache or past_key_values is not None:
                 x, v_attn, v_ffn, delta_buffer, active_mask, current_idx, present_key_value = out
-                past_key_values[i] = present_key_value
+                if past_key_values is not None:
+                    past_key_values[i] = present_key_value
             else:
                 x, v_attn, v_ffn, delta_buffer, active_mask, current_idx = out
             
             # Safely accumulate history during training outside the checkpoint block
             if past_deltas is not None:
-                past_deltas = past_deltas + [v_attn, v_ffn]
+                if getattr(self.config, "delta_block_size", 1) == 1:
+                    past_deltas = past_deltas + [v_attn, v_ffn]
+                else:
+                    past_deltas = past_deltas + [v_attn + v_ffn]
+                    
                 if len(past_deltas) > max_deltas:
                     past_deltas = past_deltas[-max_deltas:]
 
@@ -264,10 +291,14 @@ class SLMModel(nn.Module):
         # MLA typically requires a cache object or list of tensors per layer
         past_key_values = [None] * self.config.num_hidden_layers
         
-        # RoPE Caches (assuming you have a precomputed cache accessible)
-        # freqs_cis = self.freqs_cis[:seq_len_plus_max_new_tokens]
-        # For simplicity, we assume freqs_cis, cos_cache, sin_cache are managed dynamically or externally
-        # in a real generation loop, or we can just omit them here if handled automatically by the model.
+        from layers.rope import precompute_freqs_cis
+        seq_len = input_ids.shape[1]
+        freqs_cis = precompute_freqs_cis(
+            dim=self.config.qk_rope_head_dim,
+            end=seq_len + max_new_tokens,
+            theta=self.config.rope_theta,
+            device=input_ids.device
+        )
         
         for step in range(max_new_tokens):
             # ---------------------------------------------------------
@@ -279,6 +310,12 @@ class SLMModel(nn.Module):
             # During decode, we only process the single newly generated token.
             current_input_ids = input_ids if is_prefill else next_token
             
+            if is_prefill:
+                step_freqs = freqs_cis[:seq_len]
+            else:
+                # During decoding, current_input_ids has seq_len=1, we need 1 step of RoPE
+                step_freqs = freqs_cis[seq_len + step - 1 : seq_len + step]
+            
             # ---------------------------------------------------------
             # FORWARD PASS
             # ---------------------------------------------------------
@@ -287,7 +324,8 @@ class SLMModel(nn.Module):
             # - decode:  use_cache=True  -> allocates static delta buffer for compilation
             out = self.forward(
                 input_ids=current_input_ids,
-                use_cache=not is_prefill, 
+                freqs_cis=step_freqs,
+                use_cache=True, 
                 past_key_values=past_key_values, 
             )
             

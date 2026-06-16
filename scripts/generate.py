@@ -152,8 +152,8 @@ def sample(logits, temperature=0.7, top_k=50, top_p=0.9):
     return torch.multinomial(probs, num_samples=1).item()
 
 
-def generate_autoregressive(model, prompt_tokens, max_new_tokens, config, tokenizer, temperature, top_k, top_p):
-    """Standard autoregressive generation."""
+def generate_kv_cache_streaming(model, prompt_tokens, max_new_tokens, config, tokenizer, temperature, top_k, top_p):
+    """Autoregressive streaming generation using KV cache for production speed."""
     device = next(model.parameters()).device
     model.eval()
 
@@ -162,36 +162,58 @@ def generate_autoregressive(model, prompt_tokens, max_new_tokens, config, tokeni
     freqs_cis = precompute_freqs_cis(config.qk_rope_head_dim, max_seq_len, config.rope_theta, device)
     cos_cache, sin_cache = precompute_cos_sin(config.qk_rope_head_dim, max_seq_len, config.rope_theta, device)
 
+    # Initialize KV cache list
+    past_key_values = [None] * config.num_hidden_layers
+
     generated = list(prompt_tokens)
     print(tokenizer.decode(generated), end="", flush=True)
 
     start_time = time.time()
-    for _ in range(max_new_tokens):
-        curr_len = len(generated)
-        input_ids = torch.tensor([generated], dtype=torch.long, device=device)
+    next_token = None
+    
+    for step in range(max_new_tokens):
+        is_prefill = (step == 0)
+        
+        # During prefill, pass prompt tokens; during decode, pass only the single next_token
+        if is_prefill:
+            current_input_ids = torch.tensor([generated], dtype=torch.long, device=device)
+            step_freqs = freqs_cis[:len(prompt_tokens)]
+            step_cos = cos_cache[:len(prompt_tokens)]
+            step_sin = sin_cache[:len(prompt_tokens)]
+        else:
+            current_input_ids = torch.tensor([[next_token]], dtype=torch.long, device=device)
+            step_freqs = freqs_cis[len(prompt_tokens) + step - 1 : len(prompt_tokens) + step]
+            step_cos = cos_cache[len(prompt_tokens) + step - 1 : len(prompt_tokens) + step]
+            step_sin = sin_cache[len(prompt_tokens) + step - 1 : len(prompt_tokens) + step]
 
         with torch.no_grad():
-            f_cis = freqs_cis[:curr_len]
-            c_cache = cos_cache[:curr_len]
-            s_cache = sin_cache[:curr_len]
-            
-            logits_list = model(
-                input_ids,
-                freqs_cis=f_cis,
-                cos_cache=c_cache,
-                sin_cache=s_cache,
+            out = model(
+                current_input_ids,
+                freqs_cis=step_freqs,
+                cos_cache=step_cos,
+                sin_cache=step_sin,
+                use_cache=True,
+                past_key_values=past_key_values,
                 use_mtp=False,
             )
 
+        logits = out[0] if isinstance(out, tuple) else out
+        if isinstance(out, tuple):
+            past_key_values = out[1]
+
         # Autoregressive next token is predicted by the main head (index 0)
-        next_token_logits = logits_list[0][0, -1, :]
+        next_token_logits = logits[0][0, -1, :]
         next_token = sample(next_token_logits, temperature, top_k, top_p)
         generated.append(next_token)
         print(tokenizer.decode([next_token]), end="", flush=True)
 
+        # Stop generation if EOS token is reached
+        if next_token == tokenizer.eos_token_id:
+            break
+
     elapsed = time.time() - start_time
     print("\n" + "=" * 50)
-    print(f"Standard autoregressive decoding: {max_new_tokens} tokens in {elapsed:.2f}s ({max_new_tokens / elapsed:.2f} tokens/sec)")
+    print(f"Streaming KV cache decoding: {len(generated) - len(prompt_tokens)} tokens in {elapsed:.2f}s ({(len(generated) - len(prompt_tokens)) / elapsed:.2f} tokens/sec)")
     print("=" * 50)
     return generated
 
@@ -250,8 +272,8 @@ def main():
     prompt_tokens = tokenizer.encode(prompt)
     print(f"Encoded prompt: {prompt_tokens} (Length: {len(prompt_tokens)})")
 
-    print("Starting standard autoregressive decoding...")
-    generate_autoregressive(
+    print("Starting streaming KV-cached decoding...")
+    generate_kv_cache_streaming(
         model=model,
         prompt_tokens=prompt_tokens,
         max_new_tokens=args.max_new_tokens,

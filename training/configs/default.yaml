@@ -7,9 +7,9 @@
 model:
   vocab_size: 65536
   hidden_size: 1280              # Reduced from 2048 for 16GB VRAM budget
-  num_hidden_layers: 24
+  num_hidden_layers: 28
   num_attention_heads: 10        # 1280 / 128 = 10 heads
-  intermediate_size: 5120        # 4 * 1280
+  intermediate_size: 4096        # aligned to power of 2
   max_position_embeddings: 8192
   rms_norm_eps: 1.0e-6
 
@@ -47,6 +47,7 @@ model:
   # Weight Tying & Memory Optimizations
   tie_word_embeddings: true
   max_delta_history: 2
+  delta_block_size: 2
   gradient_checkpointing: true
   gradient_checkpointing_interval: 1
 

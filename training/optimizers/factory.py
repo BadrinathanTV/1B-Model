@@ -71,7 +71,7 @@ def build_optimizer(model: torch.nn.Module, config: SLMConfig) -> torch.optim.Op
             "params": adam_params,
             "lr": opt_cfg.base_lr * adamw_cfg.lr_scale,
             "use_aurora": False,
-            "weight_decay": adamw_cfg.weight_decay,
+            "weight_decay": 0.0,  # Disable decay for embeddings, norms, and biases
             "eps": adamw_cfg.eps,
             "betas": adamw_cfg.betas,
         },
