@@ -39,6 +39,7 @@ data/
 *.safetensors
 *.model
 tokenizer.json
+!models/tokenizer_bpe_65528_agentic_reasoning/tokenizer.json
 
 # Logs & Monitoring
 **/logs/
