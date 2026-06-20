@@ -22,15 +22,17 @@ def format_fim(prefix, middle, suffix):
         # SPM format (Suffix-Prefix-Middle)
         return f"<|fim_suffix|>{suffix}<|fim_prefix|>{prefix}<|fim_middle|>{middle}<|im_end|>"
 
-def stream_folder(folder_path):
+def stream_folder(folder_path, column_name="text"):
     import glob
+    import pyarrow.parquet as pq
     for f in glob.glob(os.path.join(folder_path, "**", "*.parquet"), recursive=True):
         try:
-            table = pq.read_table(f, columns=["text"])
-            for val in table["text"]:
-                text = val.as_py()
-                if text and len(text.strip()) > 0:
-                    yield text
+            parquet_file = pq.ParquetFile(f)
+            for batch in parquet_file.iter_batches(batch_size=1000, columns=[column_name]):
+                for val in batch[column_name]:
+                    text = val.as_py()
+                    if text and len(text.strip()) > 0:
+                        yield text
         except Exception:
             pass
 
@@ -88,73 +90,85 @@ def apply_random_fim(text):
 def process_document(args):
     text, domain = args
     
+    global THREAD_PARSER, THREAD_TOKENIZER
+    if 'THREAD_PARSER' not in globals() and domain == "code_python":
+        try:
+            PY_LANGUAGE = Language(tspython.language())
+            THREAD_PARSER = Parser(PY_LANGUAGE)
+        except Exception:
+            THREAD_PARSER = None
+            
+    if 'THREAD_TOKENIZER' not in globals():
+        THREAD_TOKENIZER = PreTrainedTokenizerFast.from_pretrained("models/tokenizer_bpe_65528_agentic_reasoning")
+        
     if domain == "code_python":
         if random.random() < FIM_RATE_CODE:
-            if random.random() < AST_FIM_RATIO:
-                global THREAD_PARSER
-                if 'THREAD_PARSER' not in globals():
-                    PY_LANGUAGE = Language(tspython.language())
-                    THREAD_PARSER = Parser(PY_LANGUAGE)
-                return apply_ast_fim(text, THREAD_PARSER)
+            if random.random() < AST_FIM_RATIO and THREAD_PARSER is not None:
+                text = apply_ast_fim(text, THREAD_PARSER)
             else:
-                return apply_random_fim(text)
+                text = apply_random_fim(text)
     elif domain == "code_sql":
         if random.random() < FIM_RATE_CODE:
-            return apply_random_fim(text)
+            text = apply_random_fim(text)
     else:
-        # Math, English, Tamil
+        # Math, English
         if random.random() < FIM_RATE_TEXT:
-            return apply_random_fim(text)
+            text = apply_random_fim(text)
                 
-    return text + "<|im_end|>"
+    processed_text = text + "<|im_end|>"
+    return THREAD_TOKENIZER.encode(processed_text, add_special_tokens=True)
 
 class WeightedDomainGenerator:
     def __init__(self, target_weights, base_dir):
-        self.weights = target_weights
-        self.domain_names = list(self.weights.keys())
-        self.probs = list(self.weights.values())
+        self.weights = dict(target_weights)
         self.generators = {}
         self.base_dir = base_dir
         
-        # Local directories mapped to domains
+        # Local directories mapped to domains and their corresponding column name
         folders = {
-            "math": ["finemath"],
-            "code_python": ["starcoder/python"],
-            "code_sql": ["starcoder/sql"],
-            "english": ["fineweb_edu"],
-            "tamil": ["tamil"]
+            "math": (["finemath"], "text"),
+            "code_python": (["starcoder_python"], "content"),
+            "code_sql": (["starcoder_sql"], "content"),
+            "english": (["fineweb_edu"], "text")
         }
         
-        for domain, f_list in folders.items():
-            self.generators[domain] = self._create_domain_generator(f_list)
+        for domain, (f_list, col_name) in folders.items():
+            self.generators[domain] = self._create_domain_generator(f_list, col_name)
             
-    def _create_domain_generator(self, folders):
-        while True:
-            yielded_any = False
-            for folder in folders:
-                folder_path = os.path.join(self.base_dir, folder)
-                if not os.path.exists(folder_path):
-                    continue
-                for text in stream_folder(folder_path):
-                    yield text
-                    yielded_any = True
-            if not yielded_any:
-                while True:
-                    yield None
+    def _create_domain_generator(self, folders, col_name):
+        # 1 Epoch / 1 Pass: Iterate over the folders exactly once, no outer while True loop.
+        for folder in folders:
+            folder_path = os.path.join(self.base_dir, folder)
+            if not os.path.exists(folder_path):
+                print(f"⚠️ Warning: Domain path {folder_path} does not exist.")
+                continue
+            for text in stream_folder(folder_path, col_name):
+                yield text
         
     def __iter__(self):
         return self
         
     def __next__(self):
-        attempts = 0
-        while attempts < 100:
-            sampled_domain = random.choices(self.domain_names, weights=self.probs, k=1)[0]
+        while self.weights:
+            # Re-normalize probabilities for remaining active domains
+            domains = list(self.weights.keys())
+            probs = list(self.weights.values())
+            total_prob = sum(probs)
+            if total_prob == 0:
+                break
+            normalized_probs = [p / total_prob for p in probs]
+            
+            sampled_domain = random.choices(domains, weights=normalized_probs, k=1)[0]
             gen = self.generators[sampled_domain]
-            text = next(gen)
-            if text is not None:
+            try:
+                text = next(gen)
                 return text, sampled_domain
-            attempts += 1
-        raise StopIteration("Failed to stream any document after multiple attempts.")
+            except StopIteration:
+                # Domain is fully exhausted after 1 epoch
+                print(f"\n📢 Domain '{sampled_domain}' fully exhausted (1 pass complete). Removing from active stream.")
+                del self.weights[sampled_domain]
+                
+        raise StopIteration("All domains are fully exhausted. 1-pass pretraining corpus generation complete.")
 
 def chunk_iterator(iterator, size):
     chunk = []
@@ -165,6 +179,8 @@ def chunk_iterator(iterator, size):
             chunk = []
     if chunk:
         yield chunk
+
+
 
 def build_corpus(samples_per_domain=float('inf'), chunk_size=1000, resume=True, split_phases=False):
     BASE_DIR = "data/raw_corpus"
@@ -185,13 +201,12 @@ def build_corpus(samples_per_domain=float('inf'), chunk_size=1000, resume=True, 
     print("Loading Tokenizer...")
     tokenizer = PreTrainedTokenizerFast.from_pretrained("models/tokenizer_bpe_65528_agentic_reasoning")
     
-    # Target weights: Math 35%, Code Python 28%, Code SQL 7%, English 20%, Tamil 10%
+    # Target weights: Math 35%, Code Python 28%, Code SQL 7%, English 30%
     target_weights = {
         "math": 0.35,
         "code_python": 0.28,
         "code_sql": 0.07,
-        "english": 0.20,
-        "tamil": 0.10
+        "english": 0.30
     }
     
     generator = WeightedDomainGenerator(target_weights, BASE_DIR)
@@ -205,7 +220,7 @@ def build_corpus(samples_per_domain=float('inf'), chunk_size=1000, resume=True, 
                 break
 
     print("Starting Multiprocessing Pipeline...")
-    pool = mp.Pool(processes=8)
+    pool = mp.Pool(processes=os.cpu_count())
     
     file_idx = 0
     MAX_TOKENS_PER_FILE = 250_000_000 # ~500MB per bin file
@@ -217,20 +232,26 @@ def build_corpus(samples_per_domain=float('inf'), chunk_size=1000, resume=True, 
     buffer = np.zeros(MAX_TOKENS_PER_FILE, dtype=np.uint16)
     buffer_idx = 0
     
+    global_stop = False
     try:
-        for raw_chunk in chunk_iterator(task_generator(), chunk_size):
-            batch_results = pool.map(process_document, raw_chunk)
-            encoded_batch = tokenizer(batch_results, add_special_tokens=True)["input_ids"]
+        for raw_chunk in chunk_iterator(task_generator(), 10000):
+            if global_stop:
+                break
             
-            # Safety validation to prevent silent uint16 wrap-around/overflow
+            encoded_batch = pool.map(process_document, raw_chunk)
+            
             for tokens in encoded_batch:
+                # Safety validation to prevent silent uint16 wrap-around/overflow
                 if len(tokens) > 0 and max(tokens) > 65535:
                     raise ValueError(
                         f"Token ID {max(tokens)} exceeds uint16 limit (65535)! "
                         f"Vocabulary exceeds safety boundary."
                     )
+
+                if total_tokens_written >= 50_000_000_000:
+                    global_stop = True
+                    break
                     
-            for tokens in encoded_batch:
                 if buffer_idx + len(tokens) >= MAX_TOKENS_PER_FILE:
                     space_left = MAX_TOKENS_PER_FILE - buffer_idx
                     buffer[buffer_idx:] = tokens[:space_left]

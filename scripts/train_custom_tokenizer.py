@@ -11,10 +11,9 @@ from tokenizers.trainers import BpeTrainer
 BASE_DIR = "data/raw_corpus"
 
 DOMAINS = {
-    "tamil": ["tamil_wikipedia", "indiccorp_tamil"],
-    "code": ["starcoder"],
-    "math": ["finemath", "pes2o"],
-    "english": ["fineweb_edu", "cosmopedia", "wikipedia"]
+    "code": ["starcoder_python", "starcoder_sql"],
+    "math": ["finemath"],
+    "english": ["fineweb_edu"]
 }
 
 def stream_folder(folder_path):
@@ -33,10 +32,11 @@ def stream_folder(folder_path):
         try:
             schema = pq.read_schema(f)
             col_name = 'text' if 'text' in schema.names else 'content'
-            table = pq.read_table(f, columns=[col_name])
-            for val in table[col_name]:
-                text = val.as_py()
-                if text and len(text.strip()) > 0: yield text
+            parquet_file = pq.ParquetFile(f)
+            for batch in parquet_file.iter_batches(batch_size=1000, columns=[col_name]):
+                for val in batch[col_name]:
+                    text = val.as_py()
+                    if text and len(text.strip()) > 0: yield text
         except Exception: pass
 
     # 3. JSON GZip files (peS2o)

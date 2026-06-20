@@ -134,6 +134,7 @@ class SLMConfig:
     tie_word_embeddings: bool = True
     max_delta_history: int = 0  # 0 means keep full history
     delta_block_size: int = 1   # 1 = per-sublayer (Delta AttnRes), 2 = per-layer (Delta Block)
+    delta_routing_rank: int = 256  # Bottleneck rank for dynamic per-token delta routing queries
     gradient_checkpointing: bool = True # Set to False for massive speedup if VRAM allows
     gradient_checkpointing_interval: int = 1 # Checkpoint every N layers (higher = faster but more memory)
 

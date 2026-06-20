@@ -6,13 +6,8 @@ from datasets import load_dataset
 TARGETS = {
     "starcoder_python": {"target_tokens": 14.0, "path": "data/raw_corpus/starcoder/python"},
     "starcoder_sql": {"target_tokens": 3.5, "path": "data/raw_corpus/starcoder/sql"},
-    "finemath": {"target_tokens": 10.5, "path": "data/raw_corpus/finemath"},
-    "pes2o": {"target_tokens": 7.0, "path": "data/raw_corpus/pes2o"},
-    "fineweb_edu": {"target_tokens": 5.0, "path": "data/raw_corpus/fineweb_edu"},
-    "cosmopedia": {"target_tokens": 3.0, "path": "data/raw_corpus/cosmopedia"},
-    "wikipedia": {"target_tokens": 2.0, "path": "data/raw_corpus/wikipedia"},
-    "indiccorp_tamil": {"target_tokens": 4.0, "path": "data/raw_corpus/indiccorp_tamil"},
-    "tamil_wikipedia": {"target_tokens": 1.0, "path": "data/raw_corpus/tamil_wikipedia"},
+    "finemath": {"target_tokens": 17.5, "path": "data/raw_corpus/finemath"},
+    "fineweb_edu": {"target_tokens": 15.0, "path": "data/raw_corpus/fineweb_edu"},
 }
 
 def get_directory_size(path):

@@ -54,12 +54,9 @@ class TransformerBlock(nn.Module):
         self.attn = MultiHeadLatentAttention(config)
         self.ffn = DenseFFN(config)
 
-        # Delta Attention Residual routing block
-        self.delta_residual = DeltaAttentionResidual(config)
-
-        # Learned query parameters (zero-initialized as per paper)
-        self.routing_q_attn = nn.Parameter(torch.zeros(config.hidden_size))
-        self.routing_q_ffn = nn.Parameter(torch.zeros(config.hidden_size))
+        # Delta Attention Residual routing blocks (separate bottleneck projections)
+        self.delta_residual_attn = DeltaAttentionResidual(config)
+        self.delta_residual_ffn = DeltaAttentionResidual(config)
 
 
 
@@ -69,8 +66,9 @@ class TransformerBlock(nn.Module):
         # ---------------------------------------------------------
         # 1. ATTENTION SUBLAYER
         # ---------------------------------------------------------
-        h_attn = self.delta_residual(
-            x, self.routing_q_attn, 
+        routing_q_attn = self.delta_residual_attn.compute_routing_q(x)
+        h_attn = self.delta_residual_attn(
+            x, routing_q_attn, 
             past_deltas=past_deltas, 
             delta_buffer=delta_buffer, 
             active_mask=active_mask
@@ -94,7 +92,7 @@ class TransformerBlock(nn.Module):
         # Update static buffer for generation
         if delta_buffer is not None:
             if self.delta_block_size == 1:
-                delta_buffer, active_mask, current_idx = self.delta_residual.update_state(
+                delta_buffer, active_mask, current_idx = self.delta_residual_attn.update_state(
                     v_attn, delta_buffer, active_mask, current_idx
                 )
 
@@ -114,8 +112,9 @@ class TransformerBlock(nn.Module):
         else:
             current_past_deltas = None
 
-        h_ffn = self.delta_residual(
-            x, self.routing_q_ffn, 
+        routing_q_ffn = self.delta_residual_ffn.compute_routing_q(x)
+        h_ffn = self.delta_residual_ffn(
+            x, routing_q_ffn, 
             past_deltas=current_past_deltas, 
             delta_buffer=delta_buffer, 
             active_mask=active_mask
@@ -127,12 +126,12 @@ class TransformerBlock(nn.Module):
         # Update static buffer for generation
         if delta_buffer is not None:
             if self.delta_block_size == 1:
-                delta_buffer, active_mask, current_idx = self.delta_residual.update_state(
+                delta_buffer, active_mask, current_idx = self.delta_residual_ffn.update_state(
                     v_ffn, delta_buffer, active_mask, current_idx
                 )
             else:
                 # Delta Block: Update buffer with the complete layer sum
-                delta_buffer, active_mask, current_idx = self.delta_residual.update_state(
+                delta_buffer, active_mask, current_idx = self.delta_residual_ffn.update_state(
                     v_attn + v_ffn, delta_buffer, active_mask, current_idx
                 )
 
@@ -225,7 +224,7 @@ class SLMModel(nn.Module):
                 past_deltas = []
         else:
             if delta_buffer is None:
-                delta_buffer, active_mask, current_idx = self.layers[0].delta_residual.init_state(
+                delta_buffer, active_mask, current_idx = self.layers[0].delta_residual_attn.init_state(
                     batch_size=batch_size, seq_len=seq_len, max_deltas=max_deltas, 
                     dtype=x.dtype, device=x.device
                 )
