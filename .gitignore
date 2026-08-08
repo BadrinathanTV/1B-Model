@@ -57,3 +57,5 @@ tokenizer.json
 # Project-specific ignored files
 text_extracts
 nvfp4_paper.txt
+corpus_cache/
+models/

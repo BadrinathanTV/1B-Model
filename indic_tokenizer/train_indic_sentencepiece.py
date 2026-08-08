@@ -40,38 +40,105 @@ def build_temperature_scaled_corpus():
 
     try:
         from datasets import load_dataset
+        from huggingface_hub import HfApi, hf_hub_download
     except ImportError:
-        raise ImportError("Please install datasets library: pip install datasets")
+        raise ImportError("Please install datasets and huggingface_hub: pip install datasets huggingface_hub")
 
     print("\n--- 1. Gathering Sangraha Data with Fallback Hierarchy ---")
     lang_files = defaultdict(list)
     lang_bytes = defaultdict(int)
 
+    # 1. Check local extracted text first
+    extracted_text_dirs = [
+        "data/sangraha_full/extracted_text",
+        "data/sangraha/extracted_text"
+    ]
+
+    # 2. Pre-fetch remote dataset file index from HF
+    api = HfApi()
+    try:
+        print("🔍 Fetching Sangraha file index from Hugging Face...")
+        all_repo_files = api.list_repo_files("ai4bharat/sangraha", repo_type="dataset")
+        repo_parquet_files = [f for f in all_repo_files if f.endswith(".parquet")]
+    except Exception as e:
+        print(f"⚠️ Could not fetch HF repo index: {e}")
+        repo_parquet_files = []
+
+    LANG_ALIASES = {"nep": ["nep", "npi"], "ori": ["ori", "ory"]}
+
     for lang in INDIC_LANGUAGES:
         collected = 0
         print(f"\nProcessing language: {lang.upper()}")
+
+        # Check local extracted text file first
+        local_txt = None
+        for edir in extracted_text_dirs:
+            candidate = os.path.join(edir, f"{lang}.txt")
+            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                local_txt = candidate
+                break
+
+        if local_txt:
+            print(f"  📁 Found local extracted text file: '{local_txt}'")
+            split_file = os.path.join(CACHE_DIR, f"{lang}_local.txt")
+            with open(local_txt, "r", encoding="utf-8") as in_f, open(split_file, "w", encoding="utf-8") as out_f:
+                for line in in_f:
+                    text = line.strip()
+                    if text:
+                        out_f.write(text + "\n")
+                        collected += len(text.encode("utf-8"))
+                        if collected >= TARGET_BYTES_PER_LANG:
+                            break
+            if os.path.exists(split_file) and os.path.getsize(split_file) > 0:
+                lang_files[lang].append(split_file)
+                print(f"    Added {os.path.getsize(split_file)/(1024*1024):.2f} MB from local text")
+                lang_bytes[lang] = collected
+                continue
+
+        # Downloading remote parquet files via hf_hub_download + pyarrow
+        possible_codes = LANG_ALIASES.get(lang, [lang])
         for split in SPLIT_FALLBACK_ORDER:
             if collected >= TARGET_BYTES_PER_LANG:
                 break
-            try:
-                print(f"  Fetching split '{split}' for {lang}...")
-                ds = load_dataset("ai4bharat/sangraha", data_dir=split, lang=lang, streaming=True, split="train")
-                
-                split_file = os.path.join(CACHE_DIR, f"{lang}_{split}.txt")
-                with open(split_file, "w", encoding="utf-8") as f:
-                    for row in ds:
-                        text = row.get("text", "").strip()
-                        if text:
-                            f.write(text + "\n")
-                            collected += len(text.encode("utf-8"))
-                            if collected >= TARGET_BYTES_PER_LANG:
-                                break
-                
-                if os.path.exists(split_file) and os.path.getsize(split_file) > 0:
+            
+            matched_files = []
+            for fpath in repo_parquet_files:
+                parts = fpath.split('/')
+                if len(parts) >= 2 and parts[0] == split:
+                    folder_base = parts[1].split('_')[0]
+                    if folder_base in possible_codes:
+                        matched_files.append(fpath)
+
+            if not matched_files:
+                continue
+
+            print(f"  Fetching split '{split}' for {lang} ({len(matched_files)} files available)...")
+            split_file = os.path.join(CACHE_DIR, f"{lang}_{split}.txt")
+            
+            with open(split_file, "w", encoding="utf-8") as out_f:
+                for fpath in matched_files:
+                    if collected >= TARGET_BYTES_PER_LANG:
+                        break
+                    try:
+                        local_pfile = hf_hub_download(repo_id="ai4bharat/sangraha", filename=fpath, repo_type="dataset")
+                        import pyarrow.parquet as pq
+                        table = pq.read_table(local_pfile, columns=["text"])
+                        for text_val in table["text"].to_pylist():
+                            text = text_val.strip() if text_val else ""
+                            if text:
+                                out_f.write(text + "\n")
+                                collected += len(text.encode("utf-8"))
+                                if collected >= TARGET_BYTES_PER_LANG:
+                                    break
+                    except Exception as e:
+                        print(f"    Warning: Failed to process {fpath}: {e}")
+
+            if os.path.exists(split_file):
+                if os.path.getsize(split_file) > 0:
                     lang_files[lang].append(split_file)
                     print(f"    Added {os.path.getsize(split_file)/(1024*1024):.2f} MB from {split}")
-            except Exception as e:
-                print(f"    Split '{split}' unavailable or failed for {lang}: {e}")
+                else:
+                    os.remove(split_file)
 
         lang_bytes[lang] = collected
 
