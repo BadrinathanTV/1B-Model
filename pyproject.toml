@@ -29,6 +29,7 @@ dependencies = [
     "nvidia-nccl-cu13; sys_platform == 'linux'",
     "nvidia-cudnn-cu13; sys_platform == 'linux'",
     "liger-kernel>=0.8.0; sys_platform == 'linux'",
+    "indic-nlp-library>=0.92",
 ]
 
 [tool.pyright]

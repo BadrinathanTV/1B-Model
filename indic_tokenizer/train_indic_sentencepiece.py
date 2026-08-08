@@ -5,15 +5,55 @@ This script handles:
 1. Downloading & streaming 22 Indic language subsets from Sangraha dataset splits.
 2. Fallback logic: 'verified' -> 'unverified' -> 'synthetic'.
 3. Temperature Scaling (T = 3.0) up-sampling for dataset balancing.
-4. SentencePiece training with script isolation, byte fallback, and 64k vocab size.
-5. HuggingFace PreTrainedTokenizerFast conversion.
+4. Script-aware Unicode normalization via indic-nlp-library.
+5. SentencePiece Unigram training with script isolation, byte fallback, and 64k vocab size.
+6. HuggingFace PreTrainedTokenizerFast conversion.
 """
 
 import os
 import math
 import random
 import glob
+import unicodedata
 from collections import defaultdict
+
+# ── Phase 1: Script-Aware Unicode Normalization ──────────────────────────────
+# Maps Sangraha ISO 639-3 codes to indic_nlp_library language codes.
+# Languages without a direct mapping (sat/Ol Chiki) get NFC-only normalization.
+LANG_TO_INDIC_CODE = {
+    "asm": "as", "ben": "bn", "brx": "hi", "doi": "hi", "gom": "kK",
+    "guj": "gu", "hin": "hi", "kan": "kn", "kas": "ur", "mai": "hi",
+    "mal": "ml", "mar": "mr", "mni": "bn", "nep": "ne", "ori": "or",
+    "pan": "pa", "san": "sa", "sat": None, "snd": "sd", "tam": "ta",
+    "tel": "te", "urd": "ur"
+}
+
+_normalizer_cache = {}
+
+def normalize_indic_text(text, lang_code):
+    """Apply script-aware Unicode normalization for Indic text."""
+    # Step 1: Standard Unicode NFC normalization
+    text = unicodedata.normalize("NFC", text)
+
+    # Step 2: Script-specific normalization via indic_nlp_library
+    indic_code = LANG_TO_INDIC_CODE.get(lang_code)
+    if indic_code:
+        if indic_code not in _normalizer_cache:
+            try:
+                from indicnlp.normalize.indic_normalize import IndicNormalizerFactory
+                factory = IndicNormalizerFactory()
+                _normalizer_cache[indic_code] = factory.get_normalizer(indic_code)
+            except Exception:
+                _normalizer_cache[indic_code] = None
+        normalizer = _normalizer_cache[indic_code]
+        if normalizer:
+            text = normalizer.normalize(text)
+
+    # Step 3: Strip zero-width characters that don't affect rendering
+    text = text.replace("\u200b", "")   # Zero-width space
+    text = text.replace("\ufeff", "")   # BOM
+
+    return text.strip()
 
 # 22 Indic Languages covered in AI4Bharat Sangraha
 INDIC_LANGUAGES = [
@@ -83,7 +123,7 @@ def build_temperature_scaled_corpus():
             split_file = os.path.join(CACHE_DIR, f"{lang}_local.txt")
             with open(local_txt, "r", encoding="utf-8") as in_f, open(split_file, "w", encoding="utf-8") as out_f:
                 for line in in_f:
-                    text = line.strip()
+                    text = normalize_indic_text(line.strip(), lang)
                     if text:
                         out_f.write(text + "\n")
                         collected += len(text.encode("utf-8"))
@@ -124,7 +164,7 @@ def build_temperature_scaled_corpus():
                         import pyarrow.parquet as pq
                         table = pq.read_table(local_pfile, columns=["text"])
                         for text_val in table["text"].to_pylist():
-                            text = text_val.strip() if text_val else ""
+                            text = normalize_indic_text(text_val.strip(), lang) if text_val else ""
                             if text:
                                 out_f.write(text + "\n")
                                 collected += len(text.encode("utf-8"))
@@ -197,7 +237,7 @@ def train_sentencepiece(corpus_path):
         input=corpus_path,
         model_prefix=model_prefix,
         vocab_size=VOCAB_SIZE,
-        model_type="bpe",
+        model_type="unigram",
         character_coverage=0.9995,
         byte_fallback=True,
         split_digits=True,
@@ -214,19 +254,23 @@ def train_sentencepiece(corpus_path):
     return f"{model_prefix}.model"
 
 def convert_to_huggingface(spm_model_path):
-    """Converts trained SentencePiece model into HuggingFace PreTrainedTokenizerFast format."""
-    print("\n--- 5. Exporting to HuggingFace PreTrainedTokenizerFast ---")
+    """Converts trained SentencePiece Unigram model into HuggingFace PreTrainedTokenizerFast format."""
+    print("\n--- 6. Exporting to HuggingFace PreTrainedTokenizerFast ---")
     from tokenizers import Tokenizer, models, decoders, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
     from transformers.convert_slow_tokenizer import SentencePieceExtractor
-    from tokenizers.models import BPE
+    from tokenizers.models import Unigram
 
     try:
         extractor = SentencePieceExtractor(spm_model_path)
-        spm_data = extractor.extract(BPE)
+        spm_data = extractor.extract(Unigram)
 
-        bpe = models.BPE(vocab=spm_data["vocab"], merges=spm_data["merges"], byte_fallback=True)
-        tokenizer_obj = Tokenizer(bpe)
+        unigram = models.Unigram(
+            vocab=spm_data["vocab"],
+            unk_id=spm_data["unk_id"],
+            byte_fallback=True
+        )
+        tokenizer_obj = Tokenizer(unigram)
         tokenizer_obj.pre_tokenizer = pre_tokenizers.Metaspace(replacement=" ", prepend_scheme="always")
         tokenizer_obj.decoder = decoders.Metaspace(replacement=" ", prepend_scheme="always")
 
