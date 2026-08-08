@@ -217,15 +217,25 @@ def train_sentencepiece(corpus_path):
 def convert_to_huggingface(spm_model_path):
     """Converts trained SentencePiece model into HuggingFace PreTrainedTokenizerFast format."""
     print("\n--- 5. Exporting to HuggingFace PreTrainedTokenizerFast ---")
-    from transformers import PreTrainedTokenizerFast
-
-    tokenizer = PreTrainedTokenizerFast(
-        vocab_file=spm_model_path,
-        bos_token="<s>",
-        eos_token="</s>",
-        unk_token="<unk>",
-        pad_token="<pad>"
-    )
+    try:
+        from transformers import LlamaTokenizerFast
+        tokenizer = LlamaTokenizerFast(
+            vocab_file=spm_model_path,
+            bos_token="<s>",
+            eos_token="</s>",
+            unk_token="<unk>",
+            pad_token="<pad>"
+        )
+    except Exception as e:
+        print(f"⚠️ Falling back to PreTrainedTokenizerFast: {e}")
+        from transformers import PreTrainedTokenizerFast
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_file=spm_model_path,
+            bos_token="<s>",
+            eos_token="</s>",
+            unk_token="<unk>",
+            pad_token="<pad>"
+        )
 
     tokenizer.save_pretrained(OUTPUT_DIR)
     print(f"🎉 Final Indic Tokenizer ready at: {OUTPUT_DIR}")
