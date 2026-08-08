@@ -161,57 +161,7 @@ def compute_loss(hidden_states_list, targets, lm_head_weight, config: SLMConfig,
     return total_loss, metrics
 
 
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
-
-class PretrainingDataset(Dataset):
-    """Streams data from memmapped .bin files, falling back to dummy data if empty.
-
-    Standard next-token prediction (NTP).
-    """
-    def __init__(self, data_dir: str, seq_len: int, vocab_size: int):
-        self.seq_len = seq_len
-        self.vocab_size = vocab_size
-        self.files = sorted(glob.glob(os.path.join(data_dir, "*.bin")))
-
-        self.chunk_size = seq_len + 1
-
-        self.memmaps = []
-        self.cumulative_lengths = [0]
-
-        if self.files:
-            for f in self.files:
-                m = np.memmap(f, dtype=np.uint16, mode='r')
-                self.memmaps.append(m)
-                valid_len = len(m) // self.chunk_size
-                self.cumulative_lengths.append(self.cumulative_lengths[-1] + valid_len)
-            self.total_length = self.cumulative_lengths[-1]
-            self.use_dummy = False
-        else:
-            self.total_length = 1000000 # 1M steps of dummy data
-            self.use_dummy = True
-
-    def __len__(self):
-        return self.total_length
-
-    def __getitem__(self, index):
-        if self.use_dummy:
-            inputs = torch.randint(0, self.vocab_size, (self.seq_len,))
-            targets = torch.randint(0, self.vocab_size, (self.seq_len,))
-            return inputs, targets
-
-        file_idx = bisect.bisect_right(self.cumulative_lengths, index) - 1
-        if file_idx >= len(self.files): file_idx = len(self.files) - 1
-        local_chunk_idx = index - self.cumulative_lengths[file_idx]
-        local_idx = local_chunk_idx * self.chunk_size
-
-        chunk = self.memmaps[file_idx][local_idx : local_idx + self.chunk_size]
-        chunk = torch.from_numpy(chunk.astype(np.int64))
-
-        inputs = chunk[:-1]
-        targets = chunk[1:]
-
-        return inputs, targets
+from dataloader import CurriculumIterableDataset
 
 
 def evaluate(model, dataloader, accelerator, config, lm_head_weight, freqs_cis, cos_cache, sin_cache, eval_steps=50):
@@ -369,38 +319,37 @@ def main():
     # ── [4.5] Dataset & DataLoader ──
     accelerator.print("[4.5] Preparing Dataset & DataLoader...", flush=True)
 
-    dataset = PretrainingDataset(
+    dataset = CurriculumIterableDataset(
         data_dir=args.data_dir,
         seq_len=seq_len,
         vocab_size=config.vocab_size,
     )
-    if dataset.use_dummy:
-        accelerator.print("      Warning: No .bin files found in data_dir, falling back to dummy data.", flush=True)
+    if getattr(dataset, 'use_dummy', False):
+        accelerator.print("      Warning: No curriculum phases found in data_dir, falling back to dummy data.", flush=True)
 
-    def make_dataloader(ds, shuffle=True):
+    from torch.utils.data import DataLoader
+    def make_dataloader(ds):
         dl = DataLoader(
             ds,
             batch_size=train_cfg.batch_size,
-            shuffle=shuffle,
             num_workers=4,
             pin_memory=True,
-            drop_last=True,
             persistent_workers=True,
         )
         return accelerator.prepare(dl)
 
-    dataloader = make_dataloader(dataset, shuffle=True)
+    dataloader = make_dataloader(dataset)
     
     # ── Validation Dataloaders ──
     dataloader_val = None
     if args.val_data_dir and os.path.exists(args.val_data_dir):
         accelerator.print("      Setting up validation dataloaders...", flush=True)
-        dataset_val = PretrainingDataset(
+        dataset_val = CurriculumIterableDataset(
             data_dir=args.val_data_dir,
             seq_len=seq_len,
             vocab_size=config.vocab_size,
         )
-        dataloader_val = make_dataloader(dataset_val, shuffle=False)
+        dataloader_val = make_dataloader(dataset_val)
 
     accelerator.print("      Done.\n", flush=True)
 
