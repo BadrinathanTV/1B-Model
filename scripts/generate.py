@@ -54,7 +54,7 @@ def parse_args():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.7,
+        default=1,
         help="Sampling temperature (0.0 for greedy decoding).",
     )
     parser.add_argument(
