@@ -110,7 +110,7 @@ def pack_tokens(token_stream, output_prefix: str, target_tokens: int, tokenizer)
     buffer = []
     buffer_size = 1_000_000  # Write in 1M token chunks
 
-    pbar = tqdm(total=target_tokens, desc=os.path.basename(output_prefix), unit="tok", leave=False)
+    pbar = tqdm(total=target_tokens, desc=os.path.basename(output_prefix), unit="tok", leave=True)
 
     while tokens_written < target_tokens:
         try:
