@@ -36,17 +36,26 @@ def get_monolingual_stream(lang: str):
     Yields raw text strings for a specific language from local files.
     """
     if lang == "eng":
-        file_path = "data/english/fineweb_edu.txt"
+        candidate_paths = ["data/english/fineweb_edu.txt"]
     elif lang == "code":
-        file_path = "data/code/starcoder_python.txt"
+        candidate_paths = ["data/code/starcoder_python.txt", "data/code/codeparrot_clean.txt"]
     else:
-        # Assuming Sangraha extracts are saved here per previous scripts
-        file_path = f"data/sangraha_full/extracted_text/{lang}.txt"
+        # Check all possible locations where Sangraha text might be stored
+        candidate_paths = [
+            f"data/sangraha_full/extracted_text/{lang}.txt",
+            f"data/sangraha/extracted_text/{lang}.txt",
+            f"corpus_cache/{lang}_local.txt",
+        ] + glob.glob(f"corpus_cache/{lang}_*.txt")
+
+    file_path = None
+    for cp in candidate_paths:
+        if os.path.exists(cp) and os.path.getsize(cp) > 0:
+            file_path = cp
+            break
         
-    if not os.path.exists(file_path):
+    if not file_path:
         # Fallback if file doesn't exist to prevent crashing the whole pipeline
-        # Yield a dummy string just to keep the loop valid, or raise an error
-        print(f"⚠️ Warning: {file_path} not found. Skipping data for {lang}.")
+        print(f"⚠️ Warning: Data for {lang} not found in expected paths. Skipping.")
         return
 
     with open(file_path, "r", encoding="utf-8") as f:
