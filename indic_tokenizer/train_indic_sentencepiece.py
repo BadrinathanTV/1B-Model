@@ -243,8 +243,9 @@ def train_sentencepiece(corpus_path):
         split_digits=True,
         split_by_unicode_script=True,
         split_by_whitespace=True,
-        max_sentence_length=16384,
-        input_sentence_size=5000000,
+        max_sentence_length=4096,
+        input_sentence_size=1000000,
+        seed_sentencepiece_size=1000000,
         shuffle_input_sentence=True,
         num_threads=16,
         user_defined_symbols=RESERVED_AND_CUSTOM_TOKENS
