@@ -1,33 +1,34 @@
 [project]
 name = "llm"
 version = "0.1.0"
-description = "Add your description here"
+description = "Indic SLM and LLM codebase"
 readme = "README.md"
-requires-python = "==3.12.*"
+requires-python = ">=3.10,<3.14"
 dependencies = [
     "accelerate>=1.13.0",
     "datasets>=4.8.5",
-    "nvidia-cuda-crt==13.0.88",
-    "nvidia-cuda-nvcc==13.0.88",
-    "nvidia-nvvm==13.0.88",
     "pyyaml>=6.0",
     "schedulefree>=1.4.1",
     "tiktoken>=0.13.0",
-    "torch>=2.12.0",
+    "torch>=2.2.0",
     "torchao>=0.17.0",
     "tqdm>=4.67.3",
-    "nvidia-cuda-cccl",
-    "nvidia-nccl-cu13",
-    "nvidia-cudnn-cu13",
     "tree-sitter>=0.23.1",
     "tree-sitter-python>=0.23.2",
     "tokenizers>=0.19.0",
     "transformers>=4.40.0",
     "pyarrow>=15.0.0",
     "wandb>=0.27.0",
-    "liger-kernel>=0.8.0",
     "einops>=0.8.2",
     "sentencepiece>=0.2.2",
+    # Linux-specific CUDA runtime & kernel extensions
+    "nvidia-cuda-crt==13.0.88; sys_platform == 'linux'",
+    "nvidia-cuda-nvcc==13.0.88; sys_platform == 'linux'",
+    "nvidia-nvvm==13.0.88; sys_platform == 'linux'",
+    "nvidia-cuda-cccl; sys_platform == 'linux'",
+    "nvidia-nccl-cu13; sys_platform == 'linux'",
+    "nvidia-cudnn-cu13; sys_platform == 'linux'",
+    "liger-kernel>=0.8.0; sys_platform == 'linux'",
 ]
 
 [tool.pyright]
@@ -38,3 +39,8 @@ dev = [
     "pytest>=9.1.0",
 ]
 
+[tool.uv]
+environments = [
+    "sys_platform == 'win32'",
+    "sys_platform == 'linux'",
+]
