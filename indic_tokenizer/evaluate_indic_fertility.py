@@ -30,8 +30,32 @@ def evaluate_fertility():
         print(f"❌ Tokenizer not found at '{TOKENIZER_DIR}'. Please train the tokenizer first.")
         return
 
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
-    print(f"\n📊 Evaluating Tokenizer Fertility Rate ({TOKENIZER_DIR})")
+    tokenizer = None
+    spm_model_path = os.path.join(TOKENIZER_DIR, "spm_indic_64k.model")
+    
+    try:
+        tok = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
+        test_ids = tok.encode("भारत", add_special_tokens=False)
+        if test_ids:
+            tokenizer = tok
+    except Exception:
+        tokenizer = None
+
+    sp_proc = None
+    if tokenizer is None and os.path.exists(spm_model_path):
+        try:
+            import sentencepiece as spm
+            sp_proc = spm.SentencePieceProcessor()
+            sp_proc.load(spm_model_path)
+        except Exception as e:
+            print(f"⚠️ Could not load SentencePiece model: {e}")
+
+    if tokenizer is None and sp_proc is None:
+        print(f"❌ Could not load valid tokenizer from '{TOKENIZER_DIR}'.")
+        return
+
+    mode_str = "HuggingFace AutoTokenizer" if tokenizer is not None else "SentencePiece Processor"
+    print(f"\n📊 Evaluating Tokenizer Fertility Rate ({TOKENIZER_DIR}) - Mode: {mode_str}")
     print(f"{'Language Script':<25} | {'Words':<8} | {'Tokens':<8} | {'Fertility (Tokens/Word)':<22}")
     print("-" * 72)
 
@@ -40,7 +64,10 @@ def evaluate_fertility():
 
     for lang_name, text in TEST_DATA.items():
         words = text.split()
-        tokens = tokenizer.encode(text, add_special_tokens=False)
+        if tokenizer is not None:
+            tokens = tokenizer.encode(text, add_special_tokens=False)
+        else:
+            tokens = sp_proc.encode(text, out_type=int)
         
         num_words = len(words)
         num_tokens = len(tokens)

@@ -217,18 +217,29 @@ def train_sentencepiece(corpus_path):
 def convert_to_huggingface(spm_model_path):
     """Converts trained SentencePiece model into HuggingFace PreTrainedTokenizerFast format."""
     print("\n--- 5. Exporting to HuggingFace PreTrainedTokenizerFast ---")
+    from tokenizers import Tokenizer, models, decoders, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+    from transformers.convert_slow_tokenizer import SentencePieceExtractor
+    from tokenizers.models import BPE
+
     try:
-        from transformers import LlamaTokenizerFast
-        tokenizer = LlamaTokenizerFast(
-            vocab_file=spm_model_path,
+        extractor = SentencePieceExtractor(spm_model_path)
+        spm_data = extractor.extract(BPE)
+
+        bpe = models.BPE(vocab=spm_data["vocab"], merges=spm_data["merges"], byte_fallback=True)
+        tokenizer_obj = Tokenizer(bpe)
+        tokenizer_obj.pre_tokenizer = pre_tokenizers.Metaspace(replacement=" ", prepend_scheme="always")
+        tokenizer_obj.decoder = decoders.Metaspace(replacement=" ", prepend_scheme="always")
+
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer_obj,
             bos_token="<s>",
             eos_token="</s>",
             unk_token="<unk>",
             pad_token="<pad>"
         )
     except Exception as e:
-        print(f"⚠️ Falling back to PreTrainedTokenizerFast: {e}")
-        from transformers import PreTrainedTokenizerFast
+        print(f"⚠️ Falling back to default PreTrainedTokenizerFast: {e}")
         tokenizer = PreTrainedTokenizerFast(
             tokenizer_file=spm_model_path,
             bos_token="<s>",
