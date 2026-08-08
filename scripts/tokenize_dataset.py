@@ -188,10 +188,6 @@ def main():
             if target_tokens <= 0:
                 continue
             
-            # For demonstration, we'll process a small fraction so the script finishes quickly
-            # In production, remove this cap!
-            target_tokens = min(target_tokens, 50_000) # Cap at 50k tokens per lang for testing
-            
             out_prefix = os.path.join(phase_dir, "monolingual", lang)
             stream = get_monolingual_stream(lang)
             pack_tokens(stream, out_prefix, target_tokens, tokenizer)
@@ -201,8 +197,6 @@ def main():
         for pair, target_tokens in parallel_budgets.items():
             if target_tokens <= 0:
                 continue
-            
-            target_tokens = min(target_tokens, 20_000) # Cap at 20k tokens per pair for testing
             
             out_prefix = os.path.join(phase_dir, "parallel", pair)
             src, tgt = pair.split("-")
