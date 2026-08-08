@@ -182,6 +182,23 @@ def build_temperature_scaled_corpus():
 
         lang_bytes[lang] = collected
 
+    print("\n--- Gathering Auxiliary Data (English & Code) ---")
+    aux_files = {
+        "eng": "data/english/fineweb_edu.txt",
+        "code": "data/code/starcoder_python.txt"
+    }
+    for lang, file_path in aux_files.items():
+        if os.path.exists(file_path):
+            size = os.path.getsize(file_path)
+            if size > 0:
+                lang_files[lang].append(file_path)
+                # Cap the size at TARGET_BYTES_PER_LANG (100MB) so it gets equal weighting
+                # with high-resource Indic languages, preserving Indic morphology representation.
+                lang_bytes[lang] = min(size, TARGET_BYTES_PER_LANG)
+                print(f"  📁 Added {lang} from {file_path} (Capped at {lang_bytes[lang]/(1024*1024):.2f} MB for balancing)")
+        else:
+            print(f"  ⚠️ Auxiliary data for {lang} not found at {file_path}.")
+
     # Calculate Temperature Scaling probabilities
     print("\n--- 2. Computing Temperature-Scaled Probabilities (T = 3.0) ---")
     total_scaled = sum(math.pow(size, 1.0 / TEMPERATURE) for size in lang_bytes.values() if size > 0)
