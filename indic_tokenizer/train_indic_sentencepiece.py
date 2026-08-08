@@ -174,8 +174,16 @@ def build_temperature_scaled_corpus():
     print(f"✅ Multi-script corpus generated: {sampled_corpus_path} ({os.path.getsize(sampled_corpus_path)/(1024*1024):.2f} MB)")
     return sampled_corpus_path
 
+RESERVED_AND_CUSTOM_TOKENS = [
+    "<|im_start|>", "<|im_end|>", 
+    "<|system|>", "<|user|>", "<|assistant|>",
+    "<|thought|>", "<|end_thought|>",
+    "<|tool_call|>", "<|tool_result|>",
+    "<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>"
+] + [f"<|reserved_special_token_{i}|>" for i in range(256)]
+
 def train_sentencepiece(corpus_path):
-    """Trains a 64k SentencePiece BPE tokenizer with Script isolation and Byte Fallback."""
+    """Trains SentencePiece BPE model with byte fallback and Indic script optimization."""
     try:
         import sentencepiece as spm
     except ImportError:
@@ -184,12 +192,7 @@ def train_sentencepiece(corpus_path):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     model_prefix = os.path.join(OUTPUT_DIR, "spm_indic_64k")
 
-    print("\n--- 4. Training SentencePiece Model ---")
-    print(f"  Vocab Size: {VOCAB_SIZE}")
-    print("  Byte Fallback: True")
-    print("  Split by Unicode Script: True")
-    print("  Split Digits: True")
-
+    print(f"\n--- 4. Training SentencePiece Model (Vocab Size: {VOCAB_SIZE}) ---")
     spm.SentencePieceTrainer.train(
         input=corpus_path,
         model_prefix=model_prefix,
@@ -204,11 +207,7 @@ def train_sentencepiece(corpus_path):
         input_sentence_size=5000000,
         shuffle_input_sentence=True,
         num_threads=16,
-        user_defined_symbols=[
-            "<|im_start|>", "<|im_end|>", 
-            "<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>",
-            "<|thought|>", "<|end_thought|>"
-        ]
+        user_defined_symbols=RESERVED_AND_CUSTOM_TOKENS
     )
 
     print("✅ SentencePiece binary model generated successfully!")
@@ -236,7 +235,8 @@ def convert_to_huggingface(spm_model_path):
             bos_token="<s>",
             eos_token="</s>",
             unk_token="<unk>",
-            pad_token="<pad>"
+            pad_token="<pad>",
+            additional_special_tokens=RESERVED_AND_CUSTOM_TOKENS
         )
     except Exception as e:
         print(f"⚠️ Falling back to default PreTrainedTokenizerFast: {e}")
@@ -245,7 +245,8 @@ def convert_to_huggingface(spm_model_path):
             bos_token="<s>",
             eos_token="</s>",
             unk_token="<unk>",
-            pad_token="<pad>"
+            pad_token="<pad>",
+            additional_special_tokens=RESERVED_AND_CUSTOM_TOKENS
         )
 
     tokenizer.save_pretrained(OUTPUT_DIR)
