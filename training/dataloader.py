@@ -18,18 +18,15 @@ class CurriculumIterableDataset(IterableDataset):
         self.vocab_size = vocab_size
         self.chunk_size = seq_len + 1
         self.seed = seed
-        self.generator = torch.Generator().manual_seed(seed)
         
         # Discover tokenized files (grouped by phase in the previous script)
-        # However, the user wants dynamic batch sampling. We can still use the phase 
-        # structure, but sample across the files dynamically based on weights.
         self.phases = sorted(glob.glob(os.path.join(data_dir, "phase_*")))
         
         if not self.phases:
             self.use_dummy = True
         else:
             self.use_dummy = False
-            self.phase_datasets = {}  # {phase_dir: {file_path: (memmap, valid_chunks)}}
+            self.phase_datasets = {}  # {phase_dir: {file_path: valid_chunks}}
             self.phase_weights = {}   # {phase_dir: [weight_1, weight_2, ...]}
             self.phase_file_list = {} # {phase_dir: [file_1, file_2, ...]}
             
@@ -46,21 +43,21 @@ class CurriculumIterableDataset(IterableDataset):
                 weights = []
                 file_list = []
                 
-                # If manifest exists, we can extract the exact token budget targeted for this file
-                # and use it as the probability weight. If not, we fall back to file size.
                 phase_manifest = manifest["curriculum"][i] if manifest else None
                 
                 for f in bin_files:
-                    m = np.memmap(f, dtype=np.uint16, mode='r')
-                    valid_chunks = len(m) // self.chunk_size
+                    # Lazily calculate chunks based on file size (2 bytes per uint16 token)
+                    # This prevents creating unpicklable memmap objects in the main process (fixes Windows multiprocessing crash)
+                    num_tokens = os.path.getsize(f) // 2
+                    valid_chunks = num_tokens // self.chunk_size
+                    
                     if valid_chunks > 0:
-                        datasets[f] = (m, valid_chunks)
+                        datasets[f] = valid_chunks
                         file_list.append(f)
                         
                         # Determine sampling weight
-                        weight = valid_chunks  # Default: proportional to available data size
+                        weight = valid_chunks
                         if phase_manifest:
-                            # Match the filename to the manifest budget (e.g. "hin" from "hin_0000.bin")
                             basename = os.path.basename(f)
                             lang_code = basename.split("_")[0]
                             if lang_code in phase_manifest.get("monolingual", {}):
@@ -71,7 +68,6 @@ class CurriculumIterableDataset(IterableDataset):
                         weights.append(weight)
                 
                 if file_list:
-                    # Normalize weights to probabilities
                     total_weight = sum(weights)
                     probs = [w / total_weight for w in weights]
                     
@@ -79,13 +75,13 @@ class CurriculumIterableDataset(IterableDataset):
                     self.phase_weights[phase_dir] = probs
                     self.phase_file_list[phase_dir] = file_list
 
-    def _get_dummy_stream(self):
+    def _get_dummy_stream(self, generator):
         while True:
             inputs = torch.randint(0, self.vocab_size, (self.seq_len,))
             targets = torch.randint(0, self.vocab_size, (self.seq_len,))
             yield inputs, targets
 
-    def _get_phase_stream(self, phase_dir: str):
+    def _get_phase_stream(self, phase_dir: str, generator):
         file_list = self.phase_file_list.get(phase_dir)
         if not file_list:
             return
@@ -93,26 +89,21 @@ class CurriculumIterableDataset(IterableDataset):
         probs = self.phase_weights[phase_dir]
         datasets = self.phase_datasets[phase_dir]
         
-        # Track pointers for sequential reading within randomly selected files
+        # Open memmaps lazily in the worker process
+        memmaps = {f: np.memmap(f, dtype=np.uint16, mode='r') for f in file_list}
         pointers = {f: 0 for f in file_list}
         
-        # Calculate how many sequences we should yield for this phase
-        # We can yield infinitely, but to transition phases we should bound it.
-        # Let's say a phase lasts for N total sequences across all datasets in the phase.
-        total_chunks = sum(ds[1] for ds in datasets.values())
+        total_chunks = sum(datasets.values())
+        probs_tensor = torch.tensor(probs, dtype=torch.float32)
         
         for _ in range(total_chunks):
-            # 1. Dynamically sample a language/pair based on alpha-smoothed probabilities!
-            # Using torch.multinomial is faster, but random.choices or numpy works too.
-            # Convert probs to a tensor for fast sampling
-            probs_tensor = torch.tensor(probs, dtype=torch.float32)
-            idx = torch.multinomial(probs_tensor, 1, generator=self.generator).item()
+            idx = torch.multinomial(probs_tensor, 1, generator=generator).item()
             selected_file = file_list[idx]
             
-            m, max_chunks = datasets[selected_file]
+            m = memmaps[selected_file]
+            max_chunks = datasets[selected_file]
             ptr = pointers[selected_file]
             
-            # If we hit the end of a specific file, loop it (so we maintain strict ratios)
             if ptr >= max_chunks:
                 ptr = 0
             
@@ -128,11 +119,11 @@ class CurriculumIterableDataset(IterableDataset):
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
-        if worker_info is not None:
-            self.generator.manual_seed(self.seed + worker_info.id)
+        seed = self.seed + (worker_info.id if worker_info else 0)
+        generator = torch.Generator().manual_seed(seed)
 
         if self.use_dummy:
-            yield from self._get_dummy_stream()
+            yield from self._get_dummy_stream(generator)
         else:
             for phase_dir in self.phases:
-                yield from self._get_phase_stream(phase_dir)
+                yield from self._get_phase_stream(phase_dir, generator)
