@@ -60,12 +60,13 @@ class CurriculumIterableDataset(IterableDataset):
                         # Determine sampling weight
                         weight = valid_chunks  # Default: proportional to available data size
                         if phase_manifest:
-                            # Try to match the filename to the manifest budget (e.g. "hin" or "hin-tam")
-                            basename = os.path.basename(os.path.dirname(f))
-                            if basename in phase_manifest.get("monolingual", {}):
-                                weight = phase_manifest["monolingual"][basename]
-                            elif basename in phase_manifest.get("parallel", {}):
-                                weight = phase_manifest["parallel"][basename]
+                            # Match the filename to the manifest budget (e.g. "hin" from "hin_0000.bin")
+                            basename = os.path.basename(f)
+                            lang_code = basename.split("_")[0]
+                            if lang_code in phase_manifest.get("monolingual", {}):
+                                weight = phase_manifest["monolingual"][lang_code]
+                            elif lang_code in phase_manifest.get("parallel", {}):
+                                weight = phase_manifest["parallel"][lang_code]
                         
                         weights.append(weight)
                 
